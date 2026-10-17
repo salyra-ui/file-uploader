@@ -61,8 +61,18 @@ end
 defmodule SalyraUpload.DiskSessions do
   alias SalyraUpload.Disk
   # Locks coordinate connected BEAM nodes. Independent clusters require a database SessionStore.
-  def transaction(directory, id, operation),
-    do: :global.trans({{__MODULE__, Path.expand(directory), Disk.safe(id)}, self()}, operation)
+  # A bounded number of attempts: a session held too long answers BUSY instead of waiting forever.
+  def transaction(directory, id, operation) do
+    lock = {{__MODULE__, Path.expand(directory), Disk.safe(id)}, self()}
+
+    case :global.trans(lock, operation, [node() | Node.list()], 30) do
+      :aborted ->
+        raise SalyraUpload.Error, status: 503, code: "BUSY", message: "Upload session is busy"
+
+      result ->
+        result
+    end
+  end
 
   def get(directory, id) do
     path = Path.join(directory, Disk.safe(id) <> ".json")
