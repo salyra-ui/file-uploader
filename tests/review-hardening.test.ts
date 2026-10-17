@@ -53,9 +53,10 @@ it("accepts upload metadata only as application/json", () =>
       Object.assign(Readable.from([Buffer.from("{}")]), {
         headers: { "content-type": type, "idempotency-key": "k" },
       }) as unknown as IncomingMessage;
-    await expect(handlers.create(request("text/plain"))).rejects.toMatchObject(
-      { status: 415, code: "CONTENT_TYPE" },
-    );
+    await expect(handlers.create(request("text/plain"))).rejects.toMatchObject({
+      status: 415,
+      code: "CONTENT_TYPE",
+    });
     // the right type gets past the check, to the descriptor validation
     await expect(
       handlers.create(request("application/json; charset=utf-8")),
@@ -159,3 +160,97 @@ it("S3 objects are attachments of a checked type; removal stays in its bucket", 
     input: { Bucket: "docs", Key: "uploads/abc" },
   });
 });
+
+const sha = (data: string | Buffer) =>
+  createHash("sha256").update(data).digest("hex");
+const descriptor = (size: number, chunkSize: number) => ({
+  protocol: "salyra-upload/1" as const,
+  name: "notes.txt",
+  type: "text/plain",
+  size,
+  lastModified: 0,
+  chunkSize,
+});
+
+it("a slow chunk does not hold the session: other chunks are stored meanwhile", () =>
+  temporary(async (dir) => {
+    const engine = createUploadServer({
+      allowAnonymous: true,
+      sessionStore: filesystemSessionStore(join(dir, "s")),
+      storage: filesystemStorage(join(dir, "c")),
+    });
+    const { id } = await engine.createUpload(descriptor(8, 4), "slow");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const slow = Readable.from(
+      (async function* () {
+        yield Buffer.from("ab");
+        await gate;
+        yield Buffer.from("cd");
+      })(),
+    );
+    const first = engine.receivePart(id, 0, sha("abcd"), slow);
+    // the second chunk completes while the first is still streaming
+    await expect(
+      engine.receivePart(
+        id,
+        1,
+        sha("efgh"),
+        Readable.from([Buffer.from("efgh")]),
+      ),
+    ).resolves.toMatchObject({ index: 1 });
+    release();
+    await expect(first).resolves.toMatchObject({ index: 0 });
+    await expect(engine.finishUpload(id)).resolves.toMatchObject({
+      size: 8,
+      sha256: sha("abcdefgh"),
+    });
+  }));
+
+it("the receipt journal keeps every chunk written side by side", () =>
+  temporary(async (dir) => {
+    const { filesystemReceiptJournal } =
+      await import("../packages/upload-server/src/storage/filesystem");
+    const journal = filesystemReceiptJournal(dir);
+    await Promise.all(
+      Array.from({ length: 20 }, (_, index) =>
+        journal.put("upload", {
+          index,
+          size: 1,
+          sha256: sha(String(index)),
+          reference: { etag: String(index) },
+        }),
+      ),
+    );
+    expect((await journal.get("upload")).map((part) => part.index)).toEqual(
+      Array.from({ length: 20 }, (_, index) => index),
+    );
+  }));
+
+it("progress extends the expiry; finished records go after retainFinished", () =>
+  temporary(async (dir) => {
+    const sessions = filesystemSessionStore(join(dir, "s"));
+    const engine = createUploadServer({
+      allowAnonymous: true,
+      sessionStore: sessions,
+      storage: filesystemStorage(join(dir, "c")),
+      sessionTTL: 60_000,
+      retainFinished: 1,
+    });
+    const created = await engine.createUpload(descriptor(8, 4), "ttl");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await engine.receivePart(
+      created.id,
+      0,
+      sha("abcd"),
+      Readable.from([Buffer.from("abcd")]),
+    );
+    expect((await engine.getUpload(created.id)).expiresAt).toBeGreaterThan(
+      created.expiresAt,
+    );
+    await engine.cancelUpload(created.id);
+    const record = (await sessions.get(created.id))!;
+    await sessions.put({ ...record, expiresAt: Date.now() - 10 });
+    await engine.sweepExpired();
+    expect(await sessions.get(created.id)).toBeUndefined();
+  }));

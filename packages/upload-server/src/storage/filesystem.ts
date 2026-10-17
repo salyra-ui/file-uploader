@@ -104,6 +104,9 @@ export function filesystemSessionStore(directory: string): SessionStore {
       }
     },
     get,
+    async remove(id) {
+      await rm(file(id), { force: true });
+    },
     async put(value) {
       await mkdir(root, { recursive: true });
       await atomicJSON(file(value.id), value);
@@ -246,7 +249,16 @@ export function filesystemStorage(directory: string): StorageAdapter {
     },
     async inspectResult(session) {
       try {
-        const measured = await measure(resultPath(session));
+        // the receipt written at finish spares hashing the whole file on every probe
+        const saved = await readFile(`${resultPath(session)}.json`, "utf8")
+          .then((text) => JSON.parse(text) as { size: number; sha256: string })
+          .catch(() => undefined);
+        const measured =
+          saved &&
+          (await stat(resultPath(session))).size === saved.size &&
+          /^[a-f0-9]{64}$/.test(saved.sha256)
+            ? saved
+            : await measure(resultPath(session));
         if (measured.size !== session.descriptor.size)
           throw new UploadServerError(
             500,
@@ -313,8 +325,10 @@ export function filesystemStorage(directory: string): StorageAdapter {
         await output.sync();
         await output.close();
         await rename(temp, target);
+        const sha256 = hash.digest("hex");
+        await atomicJSON(`${target}.json`, { size: total, sha256 });
         await rm(sessionDir(session), { recursive: true, force: true });
-        return { id: session.id, size: total, sha256: hash.digest("hex") };
+        return { id: session.id, size: total, sha256 };
       } catch (error) {
         await output.close().catch(() => {});
         await rm(temp, { force: true });
@@ -325,14 +339,18 @@ export function filesystemStorage(directory: string): StorageAdapter {
       await rm(sessionDir(session), { recursive: true, force: true });
     },
     async remove(result) {
-      await rm(resultPath({ id: (result as { id: string }).id }), {
-        force: true,
-      });
+      const target = resultPath({ id: (result as { id: string }).id });
+      await rm(target, { force: true });
+      await rm(`${target}.json`, { force: true });
     },
   };
 }
 
-/** Use with S3/R2 on one host. The engine's session transaction covers journal mutations. */
+/**
+ * Use with S3/R2 on one host. One file per chunk receipt and one for the multipart reference:
+ * chunks of one upload are received side by side, so no write rewrites another's record. A
+ * ledger from an earlier version (one <id>.json) is still read.
+ */
 export function filesystemReceiptJournal(
   directory: string,
 ): import("../types").ReceiptJournal {
@@ -341,42 +359,54 @@ export function filesystemReceiptJournal(
     reference?: import("../types").MultipartReference;
     parts: StoredPart[];
   };
-  const path = (id: string) => join(root, `${safe(id)}.json`);
-  async function read(id: string): Promise<Ledger> {
+  const folder = (id: string) => join(root, safe(id));
+  const legacy = (id: string) => join(root, `${safe(id)}.json`);
+  async function readJSON<T>(path: string): Promise<T | undefined> {
     try {
-      return JSON.parse(await readFile(path(id), "utf8"));
+      return JSON.parse(await readFile(path, "utf8")) as T;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT")
-        return { parts: [] };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
   }
-  async function save(id: string, value: Ledger) {
-    await mkdir(root, { recursive: true });
-    await atomicJSON(path(id), value);
-  }
   return {
     async get(id) {
-      return (await read(id)).parts;
+      const parts = new Map<number, StoredPart>();
+      for (const part of (await readJSON<Ledger>(legacy(id)))?.parts ?? [])
+        parts.set(part.index, part);
+      let names: string[] = [];
+      try {
+        names = await readdir(folder(id));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      for (const name of names)
+        if (/^\d+\.json$/.test(name)) {
+          const part = await readJSON<StoredPart>(join(folder(id), name));
+          if (part) parts.set(part.index, part);
+        }
+      return [...parts.values()].sort((a, b) => a.index - b.index);
     },
     async put(id, part) {
-      const value = await read(id);
-      value.parts = [
-        ...value.parts.filter((saved) => saved.index !== part.index),
-        part,
-      ];
-      await save(id, value);
+      if (!Number.isSafeInteger(part.index) || part.index < 0)
+        throw new UploadServerError(400, "PART", "Invalid chunk number");
+      await mkdir(folder(id), { recursive: true });
+      await atomicJSON(join(folder(id), `${part.index}.json`), part);
     },
     async getReference(id) {
-      return (await read(id)).reference;
+      return (
+        (await readJSON<import("../types").MultipartReference>(
+          join(folder(id), "reference.json"),
+        )) ?? (await readJSON<Ledger>(legacy(id)))?.reference
+      );
     },
     async putReference(id, reference) {
-      const value = await read(id);
-      value.reference = reference;
-      await save(id, value);
+      await mkdir(folder(id), { recursive: true });
+      await atomicJSON(join(folder(id), "reference.json"), reference);
     },
     async remove(id) {
-      await rm(path(id), { force: true });
+      await rm(folder(id), { recursive: true, force: true });
+      await rm(legacy(id), { force: true });
     },
   };
 }

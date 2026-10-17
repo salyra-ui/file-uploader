@@ -30,6 +30,8 @@ export interface SessionStore {
   get(id: string): Promise<ServerSession | undefined>;
   put(value: ServerSession): Promise<void>;
   list(): AsyncIterable<ServerSession>;
+  /** Deletes a finished session's record; sweepExpired uses it after retainFinished. */
+  remove?(id: string): Promise<void>;
 }
 export interface StorageAdapter {
   capabilities: {
@@ -68,7 +70,13 @@ export interface ServerOptions<Context = unknown> {
   storage: StorageAdapter;
   maxFileSize?: number;
   maxChunkSize?: number;
+  /** Inactivity before an unfinished upload expires; each stored chunk extends it. */
   sessionTTL?: number;
+  /**
+   * How long sweepExpired keeps the record of a completed, canceled or expired upload after its
+   * expiry, so retries and probes still find it (default 7 days). Completed files stay.
+   */
+  retainFinished?: number;
   /**
    * Without authorize, anyone who can reach the routes can create, read and finish uploads. The
    * server refuses to start without it unless this is set (local demos, tests).
@@ -114,6 +122,7 @@ export interface MultipartReference {
 }
 export interface ReceiptJournal {
   get(sessionId: string): Promise<StoredPart[]>;
+  /** Called side by side for different chunk numbers of one upload: one record must not overwrite another. */
   put(sessionId: string, part: StoredPart): Promise<void>;
   getReference(sessionId: string): Promise<MultipartReference | undefined>;
   putReference(sessionId: string, reference: MultipartReference): Promise<void>;

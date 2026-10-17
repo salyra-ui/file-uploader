@@ -34,6 +34,7 @@ export function createUploadServer<Context = unknown>(
     );
   for (const [name, value] of Object.entries({
     sessionTTL: options.sessionTTL,
+    retainFinished: options.retainFinished,
     maxChunkSize: options.maxChunkSize,
     maxFileSize: options.maxFileSize,
   })) {
@@ -196,6 +197,7 @@ export function createUploadServer<Context = unknown>(
         typeof descriptor.name !== "string" ||
         [...descriptor.name].length > 1024 ||
         typeof descriptor.type !== "string" ||
+        descriptor.type.length > 255 ||
         !Number.isSafeInteger(descriptor.size) ||
         descriptor.size < 0 ||
         !Number.isSafeInteger(descriptor.lastModified) ||
@@ -293,7 +295,33 @@ export function createUploadServer<Context = unknown>(
       body: Readable,
       context?: Context,
     ) {
-      return transaction(id, async () => {
+      // Retransmitted bodies are consumed and checked. A matching header does not prove matching content.
+      async function verify(existing: StoredPart, size: number) {
+        const hash = createHash("sha256");
+        let actual = 0;
+        for await (const chunk of body) {
+          actual += chunk.length;
+          if (actual > size)
+            return fail(413, "PART_SIZE", "Chunk exceeds its expected size");
+          hash.update(chunk);
+        }
+        if (
+          actual !== size ||
+          hash.digest("hex") !== existing.sha256 ||
+          sha256 !== existing.sha256
+        )
+          return fail(
+            409,
+            "PART_CONFLICT",
+            "This chunk number already contains different data",
+          );
+        const { reference, ...receipt } = existing;
+        return receipt;
+      }
+      // The session lock is held only to check and to record. The body streams outside it, so
+      // chunks of one upload arrive side by side and a slow one blocks nobody; one writer per
+      // chunk number at a time keeps a chunk's storage write exclusive.
+      const plan = await transaction(id, async () => {
         let value = await session(id, "part", context);
         if (value.state === "finalizing")
           value = await reconcile(value, context);
@@ -314,39 +342,28 @@ export function createUploadServer<Context = unknown>(
           value.descriptor.chunkSize,
           value.descriptor.size - index * value.descriptor.chunkSize,
         );
-        const existing = value.parts.find((part) => part.index === index);
-        if (existing) {
-          // Consume and validate the retransmitted body. A matching header does not prove matching content.
-          const hash = createHash("sha256");
-          let actual = 0;
-          for await (const chunk of body) {
-            actual += chunk.length;
-            if (actual > size)
-              return fail(413, "PART_SIZE", "Chunk exceeds its expected size");
-            hash.update(chunk);
-          }
-          if (
-            actual !== size ||
-            hash.digest("hex") !== existing.sha256 ||
-            sha256 !== existing.sha256
-          )
-            return fail(
-              409,
-              "PART_CONFLICT",
-              "This chunk number already contains different data",
-            );
-          const { reference, ...receipt } = existing;
-          return receipt;
-        }
-        const part = await storage.writePart(
+        return {
           value,
-          { index, size, sha256 },
+          size,
+          existing: value.parts.find((part) => part.index === index),
+        };
+      });
+      if (plan.existing) return verify(plan.existing, plan.size);
+      return sessions.transaction(`part:${id}:${index}`, async () => {
+        // another request may have stored this chunk number while this one waited
+        const stored = (await sessions.get(id))?.parts.find(
+          (part) => part.index === index,
+        );
+        if (stored) return verify(stored, plan.size);
+        const part = await storage.writePart(
+          plan.value,
+          { index, size: plan.size, sha256 },
           body,
           context,
         );
         if (
           part.index !== index ||
-          part.size !== size ||
+          part.size !== plan.size ||
           part.sha256 !== sha256
         )
           return fail(
@@ -354,12 +371,25 @@ export function createUploadServer<Context = unknown>(
             "STORAGE_RECEIPT",
             "Storage returned an invalid receipt",
           );
-        value.parts.push(part);
-        value.parts.sort((a, b) => a.index - b.index);
-        await sessions.put(value);
-        await event("part-stored", value, context, part);
-        const { reference, ...receipt } = part;
-        return receipt;
+        return transaction(id, async () => {
+          const value = await session(id, "part", context);
+          // canceled, expired or finished while the body streamed: storage was cleaned up
+          if (value.state !== "open")
+            return fail(409, "STATE", "This upload does not accept chunks");
+          if (!value.parts.some((saved) => saved.index === index)) {
+            value.parts.push(part);
+            value.parts.sort((a, b) => a.index - b.index);
+            // progress keeps a long upload alive: the TTL counts inactivity
+            value.expiresAt = Math.max(
+              value.expiresAt,
+              Date.now() + (options.sessionTTL ?? 24 * 60 * 60 * 1000),
+            );
+            await sessions.put(value);
+            await event("part-stored", value, context, part);
+          }
+          const { reference, ...receipt } = part;
+          return receipt;
+        });
       });
     },
     async finishUpload(id: string, context?: Context) {
@@ -416,7 +446,24 @@ export function createUploadServer<Context = unknown>(
       });
     },
     async sweepExpired(context?: Context) {
-      for await (const value of sessions.list())
+      const retain = options.retainFinished ?? 7 * 24 * 60 * 60 * 1000;
+      for await (const value of sessions.list()) {
+        if (
+          sessions.remove &&
+          ["completed", "canceled", "expired"].includes(value.state) &&
+          value.expiresAt + retain <= Date.now()
+        ) {
+          await transaction(value.id, async () => {
+            const current = await sessions.get(value.id);
+            if (
+              current &&
+              ["completed", "canceled", "expired"].includes(current.state) &&
+              current.expiresAt + retain <= Date.now()
+            )
+              await sessions.remove!(current.id);
+          });
+          continue;
+        }
         if (
           value.expiresAt <= Date.now() &&
           !["completed", "canceled", "expired"].includes(value.state)
@@ -439,6 +486,7 @@ export function createUploadServer<Context = unknown>(
             }
           });
         }
+      }
     },
   };
 }
