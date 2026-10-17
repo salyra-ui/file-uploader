@@ -15,7 +15,7 @@ import {
 } from "../packages/upload-server/src/storage/filesystem";
 const sessions = filesystemSessionStore(".uploads/sessions"),
   storage = filesystemStorage(".uploads/storage");
-const engine = createUploadServer({
+const engine = createUploadServer({ allowAnonymous: true,
   sessionStore: sessions,
   storage,
   maxFileSize: 128 * 1024 * 1024,

@@ -69,6 +69,11 @@ export interface ServerOptions<Context = unknown> {
   maxFileSize?: number;
   maxChunkSize?: number;
   sessionTTL?: number;
+  /**
+   * Without authorize, anyone who can reach the routes can create, read and finish uploads. The
+   * server refuses to start without it unless this is set (local demos, tests).
+   */
+  allowAnonymous?: boolean;
   /** Must return a stable application/user scope. Session access is still authorized on every operation. */
   scope?(context: Context | undefined): string | Promise<string>;
   authorize?(

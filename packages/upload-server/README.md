@@ -11,6 +11,7 @@ import { createServer } from "node:http";
 import {
   createUploadServer,
   createUploadRouter,
+  UploadServerError,
 } from "@salyra-ui/upload-server";
 import {
   filesystemSessionStore,
@@ -21,9 +22,18 @@ const engine = createUploadServer({
   sessionStore: filesystemSessionStore("./private-uploads/sessions"),
   storage: filesystemStorage("./private-uploads/content"),
   maxFileSize: 128 * 1024 * 1024,
-  // Supply authorize and scope from your application's authentication.
+  // From your application's authentication: the context is what createUploadRouter's
+  // `context(request)` returns. Without authorize the server refuses to start, unless
+  // `allowAnonymous: true` (local demos only).
+  scope: (user) => user.id,
+  authorize: (operation, session, user) => {
+    if (!user) throw new UploadServerError(401, "AUTH", "Sign in to upload");
+  },
 });
-const upload = createUploadRouter(engine, { basePath: "/documents/uploads" });
+const upload = createUploadRouter(engine, {
+  basePath: "/documents/uploads",
+  context: (request) => currentUser(request), // your session lookup
+});
 createServer(async (request, response) => {
   if (!(await upload(request, response))) {
     response.writeHead(404);
@@ -35,6 +45,19 @@ createServer(async (request, response) => {
 Call `createUpload`, `getUpload`, `receivePart`, `finishUpload` and `cancelUpload` directly from your own controllers. Session storage and file storage are independent interfaces.
 
 `/s3` exports `s3Storage` and `r2Storage`. Install `@aws-sdk/client-s3` for these adapters and supply a persistent receipt journal. Provider SDKs are excluded from the core server entry.
+
+
+## Expired sessions
+
+Expired uploads are cleaned up when they are next touched, or by `sweepExpired()`. Run it on a
+schedule, otherwise abandoned temporary data stays on disk or in the bucket:
+
+```ts
+setInterval(() => engine.sweepExpired().catch(reportError), 15 * 60 * 1000);
+```
+
+With S3 or R2, also add a lifecycle rule that aborts incomplete multipart uploads after a few
+days: a provider upload whose ID never reached the server can only be removed that way.
 
 [Documentation](https://salyra-ui.github.io/docs/upload-server.html) · [Protocol](https://github.com/salyra-ui/file-upload/blob/main/protocol/README.md)
 

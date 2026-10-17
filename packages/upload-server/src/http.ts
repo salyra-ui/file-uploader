@@ -18,6 +18,17 @@ export function createUploadHandlers<Context = unknown>(
   options: HandlerOptions<Context> = {},
 ) {
   async function json(request: IncomingMessage) {
+    // A cross-site form can post text/plain without a CORS preflight; it cannot send this type.
+    const type = String(request.headers["content-type"] ?? "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    if (type !== "application/json")
+      throw new UploadServerError(
+        415,
+        "CONTENT_TYPE",
+        "Upload metadata must be sent as application/json",
+      );
     const chunks: Buffer[] = [];
     let length = 0;
     for await (const chunk of request) {

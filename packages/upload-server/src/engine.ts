@@ -28,6 +28,10 @@ export function createUploadServer<Context = unknown>(
   options: ServerOptions<Context>,
 ) {
   const { sessionStore: sessions, storage } = options;
+  if (!options.authorize && options.allowAnonymous !== true)
+    throw new TypeError(
+      "Provide authorize (and scope) from your authentication, or set allowAnonymous: true for a local demo",
+    );
   for (const [name, value] of Object.entries({
     sessionTTL: options.sessionTTL,
     maxChunkSize: options.maxChunkSize,

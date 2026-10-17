@@ -47,7 +47,7 @@ async function fixture(
   directories.push(dir);
   const storage = filesystemStorage(dir),
     sessions = filesystemSessionStore(join(dir, "sessions"));
-  const engine = createUploadServer({
+  const engine = createUploadServer({ allowAnonymous: true,
     storage,
     sessionStore: sessions,
     sessionTTL: options.ttl,
@@ -439,7 +439,7 @@ describe("actual HTTP transfers and durable storage", () => {
       Readable.from(["abcd"]),
       undefined,
     );
-    const restarted = createUploadServer({
+    const restarted = createUploadServer({ allowAnonymous: true,
       sessionStore: filesystemSessionStore(join(f.dir, "sessions")),
       storage: filesystemStorage(f.dir),
     });

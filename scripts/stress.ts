@@ -43,7 +43,7 @@ try {
     directory: join(directory, "storage"),
     keys: { current: () => ({ id: "stress-key", key }), resolve: () => key },
   });
-  const engine = createUploadServer({
+  const engine = createUploadServer({ allowAnonymous: true,
     sessionStore: filesystemSessionStore(join(directory, "sessions")),
     storage: encrypted
       ? protectedStorage

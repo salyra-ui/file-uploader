@@ -39,6 +39,10 @@ async function atomicJSON(path: string, value: unknown) {
   }
   await rename(temp, path);
 }
+// A lock names its owner as "<pid>:<instance>". The instance is random per process start, so a
+// lock left by an earlier run with the same PID (PID 1 in every container restart) is recognised
+// as stale instead of looking alive forever.
+const INSTANCE = randomUUID();
 /** Persistent sessions with OS-backed directory exclusion. No stale-lock stealing while another process may be alive. */
 export function filesystemSessionStore(directory: string): SessionStore {
   const root = resolve(directory);
@@ -61,7 +65,7 @@ export function filesystemSessionStore(directory: string): SessionStore {
       const deadline = Date.now() + 30000;
       while (true) {
         try {
-          await symlink(String(process.pid), lock);
+          await symlink(`${process.pid}:${INSTANCE}`, lock);
           break;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -70,12 +74,18 @@ export function filesystemSessionStore(directory: string): SessionStore {
           try {
             await mkdir(recovery);
             try {
-              const pid = Number(await readlink(lock));
-              try {
-                process.kill(pid, 0);
-              } catch (cause) {
-                if ((cause as NodeJS.ErrnoException).code === "ESRCH")
-                  await unlink(lock);
+              const [owner, instance] = (await readlink(lock)).split(":");
+              const pid = Number(owner);
+              if (pid === process.pid) {
+                // this PID is ours: the lock is live only if this very process start took it
+                if (instance !== INSTANCE) await unlink(lock);
+              } else {
+                try {
+                  process.kill(pid, 0);
+                } catch (cause) {
+                  if ((cause as NodeJS.ErrnoException).code === "ESRCH")
+                    await unlink(lock);
+                }
               }
             } finally {
               await rm(recovery, { recursive: true, force: true });

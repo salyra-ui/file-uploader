@@ -31,6 +31,12 @@ export interface S3StorageOptions {
   provider?: "s3" | "r2";
   /** Applied when creating new objects. R2 manages encryption itself and does not accept these AWS options. */
   encryption?: S3Encryption;
+  /**
+   * The stored object's Content-Type. The descriptor's type comes from the browser, so it is not
+   * trusted by default: objects are application/octet-stream, served as attachments. Return a
+   * type here only after checking it (for example against an allowlist of image types).
+   */
+  contentType?(descriptor: ServerSession["descriptor"]): string | undefined;
 }
 const reference = (session: ServerSession) => session.storageRef as Reference;
 const missing = (error: unknown) =>
@@ -71,7 +77,8 @@ export function s3Storage(options: S3StorageOptions): StorageAdapter {
       : options.encryption
         ? { ServerSideEncryption: "AES256" as const }
         : {};
-  const keyFor = (id: string) => `${options.prefix ?? "uploads/"}${id}`;
+  const prefix = options.prefix ?? "uploads/",
+    keyFor = (id: string) => `${prefix}${id}`;
   return {
     capabilities: {
       minChunkSize: 5 * 1024 * 1024,
@@ -98,6 +105,10 @@ export function s3Storage(options: S3StorageOptions): StorageAdapter {
             Key: key,
             Body: "",
             ...encryption,
+            ContentType:
+              options.contentType?.(session.descriptor) ||
+              "application/octet-stream",
+            ContentDisposition: "attachment",
             Metadata: { "salyra-session": session.id },
           }),
         );
@@ -108,7 +119,10 @@ export function s3Storage(options: S3StorageOptions): StorageAdapter {
           Bucket: bucket,
           Key: key,
           ...encryption,
-          ContentType: session.descriptor.type || "application/octet-stream",
+          ContentType:
+            options.contentType?.(session.descriptor) ||
+            "application/octet-stream",
+          ContentDisposition: "attachment",
           Metadata: { "salyra-session": session.id },
           ...(checksums ? { ChecksumAlgorithm: "SHA256" as const } : {}),
         }),
@@ -345,6 +359,19 @@ export function s3Storage(options: S3StorageOptions): StorageAdapter {
     },
     async remove(result) {
       const ref = result as { bucket: string; key: string };
+      // the result may have travelled through the application: only this adapter's objects go
+      if (
+        !ref ||
+        ref.bucket !== bucket ||
+        typeof ref.key !== "string" ||
+        !ref.key.startsWith(prefix) ||
+        !/^[a-zA-Z0-9_-]{1,100}$/.test(ref.key.slice(prefix.length))
+      )
+        throw new UploadServerError(
+          400,
+          "STORAGE_REFERENCE",
+          "This result does not belong to this storage",
+        );
       await client.send(
         new DeleteObjectCommand({ Bucket: ref.bucket, Key: ref.key }),
       );

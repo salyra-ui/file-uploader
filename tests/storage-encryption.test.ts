@@ -45,7 +45,7 @@ async function fixture(bytes = randomBytes(150000), chunkSize = 100000) {
     keys: ring,
   });
   const ledger = filesystemSessionStore(join(directory, "sessions"));
-  const engine = createUploadServer({ storage, sessionStore: ledger });
+  const engine = createUploadServer({ allowAnonymous: true, storage, sessionStore: ledger });
   const descriptor = {
     protocol: "salyra-upload/1" as const,
     name: "private.txt",
@@ -128,7 +128,7 @@ it("pins a session key across process restart and key rotation", async () => {
     directory: join(f.directory, "content"),
     keys: f.ring,
   });
-  const engine = createUploadServer({
+  const engine = createUploadServer({ allowAnonymous: true,
     storage: restarted,
     sessionStore: f.ledger,
   });

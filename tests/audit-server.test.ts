@@ -52,7 +52,7 @@ it("delivers events after releasing session transactions so callbacks can inspec
   const notifications: string[] = [];
   const errors: unknown[] = [];
   try {
-    const engine = createUploadServer({
+    const engine = createUploadServer({ allowAnonymous: true,
       sessionStore: sessions(),
       storage: filesystemStorage(dir),
       async onEvent(event) {
@@ -88,7 +88,7 @@ it.each(["probe", "sweep", "create"])(
     const ledger = sessions();
     const storage = filesystemStorage(dir);
     try {
-      const engine = createUploadServer({ sessionStore: ledger, storage });
+      const engine = createUploadServer({ allowAnonymous: true, sessionStore: ledger, storage });
       const created = await engine.createUpload(descriptor, "late-ledger");
       await engine.receivePart(created.id, 0, hash, Readable.from(["abcd"]));
       const value = (await ledger.get(created.id))!;
