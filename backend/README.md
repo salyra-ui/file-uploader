@@ -28,11 +28,17 @@ The native implementations include filesystem storage. S3 and R2 provider adapte
 
 Use storage outside the web root. The original filename is metadata, never a storage path. The filesystem adapters use generated identifiers and publish through a temporary file on the same filesystem. Hashes and sizes are checked before final publication.
 
-Filesystem coordination has an explicit deployment boundary. Go, Rust, Python, PHP, Ruby, JVM, .NET and C use host operating-system locks. Node uses local process leases. Elixir uses `:global` locks across connected BEAM nodes. Multiple unrelated hosts or disconnected BEAM clusters require a transactional database session store rather than a shared filesystem directory. Python's included filesystem lock and the C filesystem implementation target Unix.
+Filesystem coordination has an explicit deployment boundary. Go, Rust, Python, PHP, Ruby, JVM, .NET and C use host operating-system locks. Node uses local process leases that recognise a lock left by an earlier run with the same PID. Elixir uses `:global` locks across connected BEAM nodes. Multiple unrelated hosts or disconnected BEAM clusters require a transactional database session store rather than a shared filesystem directory. Python's included filesystem lock and the C filesystem implementation target Unix.
 
 ## Own routes and request context
 
 Call the engine's create, probe, part, finish and cancel operations from your own controllers. Router adapters accept their route matcher or dispatch operation. Pass authenticated request context to `scope`, `authorize` and validation hooks. Match the client transport's routes to the chosen paths.
+
+Every engine requires `authorize`: without it, anyone who reaches the routes could create, read and finish uploads. Construction fails (Rust refuses each operation, C returns `NULL`) unless anonymous access is explicit: `AllowAnonymous` (Go, .NET), `allow_anonymous` (Python, Ruby, Rust, C, Elixir), `allowAnonymous` (PHP, JVM, Node). The examples set it because they are local demos.
+
+Creation accepts its metadata only as `application/json` and answers 415 otherwise: a cross-site form can post `text/plain` without a CORS preflight, but not this type. The included clients already send it.
+
+The Node engine receives the chunks of one upload side by side, holding the session lock only to check and record each one. The native engines still hold it while a chunk streams, so their chunks of one upload arrive one after another.
 
 Creation uses a stable idempotency key scoped to the application/user. Access to an existing session is still authorized on every operation. A completed-file list and deletion route belong to the application's catalog, not the temporary-session engine.
 

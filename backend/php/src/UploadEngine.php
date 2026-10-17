@@ -1,7 +1,10 @@
 <?php
 namespace Salyra\Upload;
 final class UploadEngine {
-    public function __construct(public SessionStore $sessions, public Storage $storage, public array $options = []) {}
+    public function __construct(public SessionStore $sessions, public Storage $storage, public array $options = []) {
+        // without authorize anyone who reaches the routes can create, read and finish uploads
+        if (!isset($options['authorize']) && empty($options['allowAnonymous'])) throw new \InvalidArgumentException('Provide authorize (and scope) from your authentication, or allowAnonymous => true for a local demo');
+    }
     private function authorize(string $operation, ?array $session, mixed $context): void { if (isset($this->options['authorize'])) ($this->options['authorize'])($operation, $session, $context); }
     private function notify(string $type, array $session, mixed $context, ?array $part = null): void {
         if (!isset($this->options['notify'])) return;

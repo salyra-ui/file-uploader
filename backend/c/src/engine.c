@@ -103,7 +103,8 @@ upload_engine *upload_engine_new(const upload_options *options) {
       !options->sessions.get || !options->sessions.put ||
       !options->storage.begin || !options->storage.write_part ||
       !options->storage.probe || !options->storage.inspect ||
-      !options->storage.finish || !options->storage.abort)
+      !options->storage.finish || !options->storage.abort ||
+      (!options->authorize && !options->allow_anonymous))
     return NULL;
   upload_engine *engine = calloc(1, sizeof(*engine));
   if (!engine)

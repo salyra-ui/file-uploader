@@ -16,7 +16,7 @@ func checksum(text string) string {
 }
 func TestResumeAndFinalize(t *testing.T) {
 	dir := t.TempDir()
-	engine := New(Options{Sessions: DiskSessions{Directory: filepath.Join(dir, "sessions")}, Storage: DiskStorage{Directory: filepath.Join(dir, "storage")}})
+	engine := New(Options{AllowAnonymous: true, Sessions: DiskSessions{Directory: filepath.Join(dir, "sessions")}, Storage: DiskStorage{Directory: filepath.Join(dir, "storage")}})
 	ctx := context.Background()
 	d := Descriptor{Protocol: "salyra-upload/1", Name: "file.txt", Size: 8, ChunkSize: 4}
 	s, err := engine.CreateUpload(ctx, d, "one")

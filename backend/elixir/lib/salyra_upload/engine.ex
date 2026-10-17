@@ -6,8 +6,20 @@ defmodule SalyraUpload.Engine do
   alias SalyraUpload.Error
   defstruct [:sessions, :storage, options: %{}]
 
-  def new(sessions, storage, options \\ %{}),
-    do: %__MODULE__{sessions: sessions, storage: storage, options: options}
+  # Without :authorize anyone who reaches the routes can create, read and finish uploads:
+  # refused unless allow_anonymous: true (local demos, tests).
+  def new(sessions, storage, options \\ %{}) do
+    options = Map.new(options)
+
+    unless Map.has_key?(options, :authorize) or options[:allow_anonymous] == true,
+      do:
+        raise(
+          ArgumentError,
+          "provide :authorize (and :scope) from your authentication, or allow_anonymous: true for a local demo"
+        )
+
+    %__MODULE__{sessions: sessions, storage: storage, options: options}
+  end
 
   defp call({module, configuration}, operation, arguments),
     do: apply(module, operation, [configuration | arguments])

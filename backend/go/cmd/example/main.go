@@ -17,7 +17,7 @@ func main() {
 	if port == "" {
 		port = "4335"
 	}
-	engine := upload.New(upload.Options{Sessions: upload.DiskSessions{Directory: filepath.Join(directory, "sessions")}, Storage: upload.DiskStorage{Directory: filepath.Join(directory, "storage")}})
+	engine := upload.New(upload.Options{AllowAnonymous: true, Sessions: upload.DiskSessions{Directory: filepath.Join(directory, "sessions")}, Storage: upload.DiskStorage{Directory: filepath.Join(directory, "storage")}})
 	host := os.Getenv("HOST")
 	if host == "" {
 		host = "127.0.0.1"

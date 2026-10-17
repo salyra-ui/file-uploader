@@ -16,6 +16,19 @@ public static class UploadHttp
             switch (route.Operation)
             {
                 case "create":
+                    // a cross-site form can post text/plain without a CORS preflight, not this type
+                    if (
+                        !string.Equals(
+                            http.Request.ContentType?.Split(';')[0].Trim(),
+                            "application/json",
+                            StringComparison.OrdinalIgnoreCase
+                        )
+                    )
+                        throw new UploadException(
+                            415,
+                            "CONTENT_TYPE",
+                            "Upload metadata must be sent as application/json"
+                        );
                     using (var memory = new MemoryStream())
                     {
                         byte[] buffer = new byte[8192];

@@ -83,7 +83,10 @@ public final class UploadEngine {
     public long ttlMillis = 86400000L,
         maxFileSize = 9007199254740991L,
         maxChunkSize = 64L * 1024 * 1024;
-    public Authorize authorize = (operation, session, context) -> {};
+    /** Without it, anyone who reaches the routes can create, read and finish uploads. */
+    public Authorize authorize;
+    /** Allows an engine without authorize (local demos, tests). */
+    public boolean allowAnonymous;
     public Validate validate = (descriptor, context) -> {};
     public Scope scope = context -> "";
     public Notify notify = (id, type, session, part, context) -> {};
@@ -99,6 +102,9 @@ public final class UploadEngine {
   }
 
   public UploadEngine(SessionStore sessions, Storage storage, Options options) {
+    if (options.authorize == null && !options.allowAnonymous)
+      throw new IllegalArgumentException(
+          "Provide authorize (and scope) from your authentication, or allowAnonymous for a local demo");
     this.sessions = sessions;
     this.storage = storage;
     this.options = options;
@@ -139,7 +145,7 @@ public final class UploadEngine {
 
   public ObjectNode createUpload(ObjectNode descriptor, String key, Context context)
       throws Exception {
-    options.authorize.apply("create", null, context);
+    if (options.authorize != null) options.authorize.apply("create", null, context);
     boolean numbers = true;
     for (String field : List.of("size", "lastModified", "chunkSize")) {
       JsonNode value = descriptor.get(field);
@@ -172,7 +178,7 @@ public final class UploadEngine {
     try (AutoCloseable lease = sessions.lock(id, context)) {
       ObjectNode existing = sessions.get(id);
       if (existing != null) {
-        options.authorize.apply("create", existing, context);
+        if (options.authorize != null) options.authorize.apply("create", existing, context);
         if (!existing.path("descriptor").equals(descriptor))
           throw fail(409, "KEY_CONFLICT", "Key belongs to another file");
         if (existing.path("expiresAt").asLong() <= System.currentTimeMillis()
@@ -206,7 +212,7 @@ public final class UploadEngine {
   ObjectNode get(String id, String operation, Context context) throws Exception {
     ObjectNode session = sessions.get(id);
     if (session == null) throw fail(404, "NOT_FOUND", "Upload session was not found");
-    options.authorize.apply(operation, session, context);
+    if (options.authorize != null) options.authorize.apply(operation, session, context);
     String state = session.path("state").asText();
     if (state.equals("expired")) throw fail(410, "EXPIRED", "Session expired");
     if (session.path("expiresAt").asLong() <= System.currentTimeMillis()

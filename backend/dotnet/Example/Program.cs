@@ -5,7 +5,8 @@ var app = builder.Build();
 string directory = Environment.GetEnvironmentVariable("UPLOAD_DIRECTORY") ?? ".uploads";
 var engine = new UploadEngine(
     new DiskSessions(Path.Combine(directory, "sessions")),
-    new DiskStorage(Path.Combine(directory, "storage"))
+    new DiskStorage(Path.Combine(directory, "storage")),
+    new UploadOptions { AllowAnonymous = true } // a local demo: pass Authorize in an application
 );
 
 // Register these operations on any paths your application chooses.

@@ -45,6 +45,14 @@ def upload_app(engine, *, base_path="/uploads", match=None):
             length = int(environ.get("CONTENT_LENGTH") or 0)
             body = LimitedBody(environ["wsgi.input"], length)
             if operation == "create":
+                # a cross-site form can post text/plain without a CORS preflight, not this type
+                media = environ.get("CONTENT_TYPE", "").split(";")[0].strip().lower()
+                if media != "application/json":
+                    raise UploadError(
+                        415,
+                        "CONTENT_TYPE",
+                        "Upload metadata must be sent as application/json",
+                    )
                 if length > 65536:
                     raise UploadError(413, "JSON_SIZE", "Upload metadata is too large")
                 try:

@@ -14,6 +14,24 @@ if Code.ensure_loaded?(Plug.Conn) do
         {value, conn} =
           case route do
             {:create, _, _} ->
+              # a cross-site form can post text/plain without a CORS preflight, not this type
+              media =
+                conn
+                |> get_req_header("content-type")
+                |> List.first("")
+                |> String.split(";")
+                |> hd()
+                |> String.trim()
+                |> String.downcase()
+
+              if media != "application/json",
+                do:
+                  raise(Error,
+                    status: 415,
+                    code: "CONTENT_TYPE",
+                    message: "Upload metadata must be sent as application/json"
+                  )
+
               case read_body(conn, length: 65_536, read_length: 65_536) do
                 {:ok, bytes, conn} ->
                   descriptor =

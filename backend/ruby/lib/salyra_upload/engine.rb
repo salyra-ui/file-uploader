@@ -12,7 +12,11 @@ module SalyraUpload
   # Storage and SessionStore are duck-typed contracts with explicit streaming methods.
   class Engine
     attr_reader :sessions, :storage
-    def initialize(sessions:, storage:, ttl: 86_400, max_file_size: nil, max_chunk_size: 64 * 1024 * 1024, scope: nil, authorize: nil, validate: nil, notify: nil, notification_error: nil)
+    def initialize(sessions:, storage:, ttl: 86_400, max_file_size: nil, max_chunk_size: 64 * 1024 * 1024, scope: nil, authorize: nil, allow_anonymous: false, validate: nil, notify: nil, notification_error: nil)
+      # without authorize anyone who reaches the routes can create, read and finish uploads
+      if authorize.nil? && !allow_anonymous
+        raise ArgumentError, 'Provide authorize (and scope) from your authentication, or allow_anonymous: true for a local demo'
+      end
       @sessions, @storage = sessions, storage
       @ttl, @max_file_size, @max_chunk_size = ttl, max_file_size, max_chunk_size
       @scope, @authorize, @validate, @notify, @notification_error = scope, authorize, validate, notify, notification_error

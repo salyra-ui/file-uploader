@@ -40,8 +40,11 @@ public sealed class UploadOptions
     public long MaxFileSize { get; init; } = 9007199254740991;
     public long MaxChunkSize { get; init; } = 64 * 1024 * 1024;
     public Func<UploadContext, string> Scope { get; init; } = _ => "";
-    public Func<string, JsonObject?, UploadContext, Task> Authorize { get; init; } =
-        (_, _, _) => Task.CompletedTask;
+    /// <summary>Without it, anyone who reaches the routes can create, read and finish uploads.</summary>
+    public Func<string, JsonObject?, UploadContext, Task>? Authorize { get; init; }
+
+    /// <summary>Allows an engine without Authorize (local demos, tests).</summary>
+    public bool AllowAnonymous { get; init; }
     public Func<JsonObject, UploadContext, Task> Validate { get; init; } =
         (_, _) => Task.CompletedTask;
     public Func<
@@ -63,7 +66,17 @@ public sealed class UploadEngine(
 {
     public ISessionStore Sessions { get; } = sessions;
     public IStorage Storage { get; } = storage;
-    public UploadOptions Options { get; } = configuration ?? new();
+    public UploadOptions Options { get; } = Checked(configuration ?? new());
+
+    static UploadOptions Checked(UploadOptions options) =>
+        options.Authorize is null && !options.AllowAnonymous
+            ? throw new ArgumentException(
+                "Provide Authorize (and Scope) from your authentication, or AllowAnonymous for a local demo"
+            )
+            : options;
+
+    Task Authorized(string operation, JsonObject? session, UploadContext context) =>
+        Options.Authorize?.Invoke(operation, session, context) ?? Task.CompletedTask;
 
     static long Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -117,7 +130,7 @@ public sealed class UploadEngine(
         UploadContext context
     )
     {
-        await Options.Authorize("create", null, context);
+        await Authorized("create", null, context);
         bool valid;
         try
         {
@@ -159,7 +172,7 @@ public sealed class UploadEngine(
         var existing = await Sessions.Get(id, context.Cancellation);
         if (existing is not null)
         {
-            await Options.Authorize("create", existing, context);
+            await Authorized("create", existing, context);
             if (!JsonNode.DeepEquals(existing["descriptor"], descriptor))
                 throw Fail(409, "KEY_CONFLICT", "Key belongs to another file");
             if (Number(existing, "expiresAt") <= Now() && Text(existing, "state") == "finalizing")
@@ -197,7 +210,7 @@ public sealed class UploadEngine(
         var session =
             await Sessions.Get(id, context.Cancellation)
             ?? throw Fail(404, "NOT_FOUND", "Upload session was not found");
-        await Options.Authorize(operation, session, context);
+        await Authorized(operation, session, context);
         string state = Text(session, "state");
         if (state == "expired")
             throw Fail(410, "EXPIRED", "Session expired");

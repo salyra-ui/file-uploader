@@ -111,6 +111,15 @@ static void request(upload_engine *engine, int socket) {
   char id[101], operation[64];
   int matched = sscanf(url, "/uploads/%100[^/]/%63s", id, operation);
   if (!strcmp(method, "POST") && !strcmp(url, "/uploads")) {
+    /* a cross-site form can post text/plain without a CORS preflight, not this type */
+    const char *type = header(headers, "Content-Type");
+    if (!type || strncasecmp(type, "application/json", 16) ||
+        (type[16] && type[16] != ';' && type[16] != ' ' && type[16] != '\r')) {
+      respond(socket, 415,
+              "{\"code\":\"CONTENT_TYPE\",\"message\":\"Upload metadata must be "
+              "sent as application/json\"}");
+      return;
+    }
     if (body_length > 65536) {
       respond(socket, 413, "{}");
       return;
@@ -181,6 +190,7 @@ int main(void) {
   upload_options options = {0};
   options.sessions = upload_disk_sessions(disk);
   options.storage = upload_disk_storage(disk);
+  options.allow_anonymous = 1; /* a local demo: set authorize in an application */
   upload_engine *engine = upload_engine_new(&options);
   if (!engine)
     return 1;

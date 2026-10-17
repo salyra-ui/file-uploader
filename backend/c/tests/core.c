@@ -35,6 +35,7 @@ int main(void) {
   upload_options options = {0};
   options.sessions = upload_disk_sessions(disk);
   options.storage = upload_disk_storage(disk);
+  options.allow_anonymous = 1;
   upload_engine *engine = upload_engine_new(&options);
   assert(engine);
   upload_error error = {0};

@@ -15,7 +15,11 @@ fn main() {
         storage: Arc::new(DiskStorage {
             directory: directory.join("storage"),
         }),
-        options: Options::default(),
+        // a local demo: set authorize in an application
+        options: Options {
+            allow_anonymous: true,
+            ..Options::default()
+        },
     };
     let server = tiny_http::Server::http(format!("{host}:{port}")).unwrap();
     for request in server.incoming_requests() {

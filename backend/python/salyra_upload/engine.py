@@ -40,10 +40,17 @@ class UploadEngine:
         max_chunk_size=64 * 1024 * 1024,
         scope=None,
         authorize=None,
+        allow_anonymous=False,
         validate=None,
         notify=None,
         notification_error=None,
     ):
+        # without authorize anyone who reaches the routes can create, read and finish uploads
+        if authorize is None and not allow_anonymous:
+            raise ValueError(
+                "Provide authorize (and scope) from your authentication, "
+                "or allow_anonymous=True for a local demo"
+            )
         self.sessions, self.storage, self.ttl = sessions, storage, ttl
         self.max_file_size, self.max_chunk_size = max_file_size, max_chunk_size
         self.scope, self.authorize, self.validate = scope, authorize, validate

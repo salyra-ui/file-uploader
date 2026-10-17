@@ -3,7 +3,9 @@ directory = System.get_env("UPLOAD_DIRECTORY") || ".uploads"
 engine =
   SalyraUpload.Engine.new(
     {SalyraUpload.DiskSessions, Path.join(directory, "sessions")},
-    {SalyraUpload.DiskStorage, Path.join(directory, "storage")}
+    {SalyraUpload.DiskStorage, Path.join(directory, "storage")},
+    # a local demo: pass :authorize in an application
+    %{allow_anonymous: true}
   )
 
 {:ok, _} =

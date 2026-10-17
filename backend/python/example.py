@@ -6,7 +6,9 @@ from salyra_upload import UploadEngine, DiskSessions, DiskStorage, upload_app
 if __name__ == "__main__":
     directory = Path(os.environ.get("UPLOAD_DIRECTORY", ".uploads"))
     engine = UploadEngine(
-        DiskSessions(directory / "sessions"), DiskStorage(directory / "storage")
+        DiskSessions(directory / "sessions"),
+        DiskStorage(directory / "storage"),
+        allow_anonymous=True,  # a local demo: pass authorize in an application
     )
     with make_server(
         os.environ.get("HOST", "127.0.0.1"),

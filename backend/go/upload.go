@@ -68,6 +68,9 @@ type Options struct {
 	TTL                       time.Duration
 	Scope                     func(context.Context) string
 	Authorize                 func(context.Context, string, *Session) error
+	// Without Authorize, anyone who can reach the routes can create, read and finish uploads:
+	// New refuses that unless AllowAnonymous is set (local demos, tests).
+	AllowAnonymous bool
 	Validate                  func(context.Context, Descriptor) error
 	Notify                    func(context.Context, string, *Session, *Part) error
 	OnNotificationError       func(error)
@@ -75,6 +78,9 @@ type Options struct {
 type Engine struct{ Options Options }
 
 func New(options Options) *Engine {
+	if options.Authorize == nil && !options.AllowAnonymous {
+		panic("upload: provide Authorize (and Scope) from your authentication, or set AllowAnonymous for a local demo")
+	}
 	if options.TTL == 0 {
 		options.TTL = 24 * time.Hour
 	}
@@ -417,6 +423,11 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	switch route.Operation {
 	case "create":
+		// a cross-site form can post text/plain without a CORS preflight; it cannot send this type
+		if media := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])); media != "application/json" {
+			err = fail(415, "CONTENT_TYPE", "Upload metadata must be sent as application/json")
+			break
+		}
 		var d Descriptor
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536))
 		if err = decoder.Decode(&d); err == nil {

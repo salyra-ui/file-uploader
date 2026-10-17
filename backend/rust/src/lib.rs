@@ -112,7 +112,10 @@ pub struct Options {
     pub max_file_size: u64,
     pub max_chunk_size: u64,
     pub scope: Arc<dyn Fn(&Context) -> String + Send + Sync>,
-    pub authorize: Authorize,
+    /// Without it, anyone who reaches the routes can create, read and finish uploads: every
+    /// operation is then refused unless `allow_anonymous` is set (local demos, tests).
+    pub authorize: Option<Authorize>,
+    pub allow_anonymous: bool,
     pub validate: Validate,
     pub notify: Notify,
 }
@@ -123,7 +126,8 @@ impl Default for Options {
             max_file_size: 9_007_199_254_740_991,
             max_chunk_size: 64 * 1024 * 1024,
             scope: Arc::new(|_| String::new()),
-            authorize: Arc::new(|_, _, _| Ok(())),
+            authorize: None,
+            allow_anonymous: false,
             validate: Arc::new(|_, _| Ok(())),
             notify: Arc::new(|_, _, _, _| {}),
         }
@@ -144,8 +148,19 @@ fn count(d: &Descriptor) -> usize {
     (d.size.div_ceil(d.chunk_size).max(1)) as usize
 }
 impl Engine {
+    fn authorize(&self, op: &str, s: Option<&Session>, c: &Context) -> Result<()> {
+        match &self.options.authorize {
+            Some(authorize) => authorize(op, s, c),
+            None if self.options.allow_anonymous => Ok(()),
+            None => Err(Error::new(
+                500,
+                "AUTHORIZE",
+                "Provide authorize (and scope) from your authentication, or allow_anonymous for a local demo",
+            )),
+        }
+    }
     pub fn create_upload(&self, d: Descriptor, key: &str, c: &Context) -> Result<Value> {
-        (self.options.authorize)("create", None, c)?;
+        self.authorize("create", None, c)?;
         if d.protocol != "salyra-upload/1"
             || d.name.chars().count() > 1024
             || d.chunk_size == 0
@@ -171,7 +186,7 @@ impl Engine {
         );
         let _lease = self.sessions.lock(&id, c)?;
         if let Some(mut existing) = self.sessions.get(&id)? {
-            (self.options.authorize)("create", Some(&existing), c)?;
+            self.authorize("create", Some(&existing), c)?;
             if existing.descriptor != d {
                 return Err(Error::new(
                     409,
@@ -206,7 +221,7 @@ impl Engine {
             .sessions
             .get(id)?
             .ok_or_else(|| Error::new(404, "NOT_FOUND", "Upload session was not found"))?;
-        (self.options.authorize)(op, Some(&s), c)?;
+        self.authorize(op, Some(&s), c)?;
         if s.state == "expired" {
             return Err(Error::new(410, "EXPIRED", "Session expired"));
         };

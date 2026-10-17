@@ -15,7 +15,7 @@ final class HttpAdapter {
             }
             if (!$route) throw new UploadError(404,'NOT_FOUND','Route was not found');
             switch ($route['operation']) {
-                case 'create': $bytes=stream_get_contents($body,65537); if (strlen($bytes)>65536) throw new UploadError(413,'JSON_SIZE','Upload metadata is too large'); try { $descriptor=json_decode($bytes,true,512,JSON_THROW_ON_ERROR); } catch (\JsonException $error) { throw new UploadError(400,'JSON','Invalid JSON body'); } if (!is_array($descriptor)) throw new UploadError(400,'JSON','Invalid JSON body'); $result=$this->engine->createUpload($descriptor,$headers['idempotency-key']??'',$context); break;
+                case 'create': if (strtolower(trim(explode(';', (string)($headers['content-type'] ?? ''))[0])) !== 'application/json') throw new UploadError(415,'CONTENT_TYPE','Upload metadata must be sent as application/json'); $bytes=stream_get_contents($body,65537); if (strlen($bytes)>65536) throw new UploadError(413,'JSON_SIZE','Upload metadata is too large'); try { $descriptor=json_decode($bytes,true,512,JSON_THROW_ON_ERROR); } catch (\JsonException $error) { throw new UploadError(400,'JSON','Invalid JSON body'); } if (!is_array($descriptor)) throw new UploadError(400,'JSON','Invalid JSON body'); $result=$this->engine->createUpload($descriptor,$headers['idempotency-key']??'',$context); break;
                 case 'probe': $result=$this->engine->getUpload($route['id'],$context); break;
                 case 'part': $result=$this->engine->receivePart($route['id'],$route['index'],$headers['upload-checksum']??'',$body,$context); break;
                 case 'complete': $result=$this->engine->finishUpload($route['id'],$context); break;

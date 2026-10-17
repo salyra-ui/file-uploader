@@ -70,6 +70,11 @@ public final class HttpAdapter implements HttpHandler {
       result =
           switch (route.operation) {
             case "create" -> {
+              // a cross-site form can post text/plain without a CORS preflight, not this type
+              String type = exchange.getRequestHeaders().getFirst("Content-Type");
+              if (type == null
+                  || !type.split(";")[0].trim().equalsIgnoreCase("application/json"))
+                throw fail(415, "CONTENT_TYPE", "Upload metadata must be sent as application/json");
               byte[] body = exchange.getRequestBody().readNBytes(65537);
               if (body.length > 65536) throw fail(413, "JSON_SIZE", "Upload metadata is too large");
               JsonNode value = JSON.readTree(body);
@@ -122,10 +127,13 @@ public final class HttpAdapter implements HttpHandler {
     Path directory = Path.of(System.getenv().getOrDefault("UPLOAD_DIRECTORY", ".uploads"));
     String host = System.getenv().getOrDefault("HOST", "127.0.0.1");
     int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "4338"));
+    UploadEngine.Options options = new UploadEngine.Options();
+    options.allowAnonymous = true; // a local demo: set authorize in an application
     UploadEngine engine =
         new UploadEngine(
             new Filesystem.Sessions(directory.resolve("sessions")),
-            new Filesystem.Content(directory.resolve("storage")));
+            new Filesystem.Content(directory.resolve("storage")),
+            options);
     HttpServer server = HttpServer.create(new InetSocketAddress(host, port), 0);
     server.createContext("/uploads", new HttpAdapter(engine, "/uploads"));
     server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());

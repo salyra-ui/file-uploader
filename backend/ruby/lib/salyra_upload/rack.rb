@@ -22,6 +22,9 @@ module SalyraUpload
       body = environment['rack.input']
       result = case operation
                when 'create'
+                 # a cross-site form can post text/plain without a CORS preflight, not this type
+                 media = (environment['CONTENT_TYPE'] || environment['HTTP_CONTENT_TYPE']).to_s.split(';').first.to_s.strip.downcase
+                 raise UploadError.new(415, 'CONTENT_TYPE', 'Upload metadata must be sent as application/json') unless media == 'application/json'
                  bytes = body.read(65_537)
                  raise UploadError.new(413, 'JSON_SIZE', 'Upload metadata is too large') if bytes.bytesize > 65_536
                  @engine.create_upload(JSON.parse(bytes), environment['HTTP_IDEMPOTENCY_KEY'] || '', environment)

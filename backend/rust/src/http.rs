@@ -46,6 +46,21 @@ pub fn handle(engine: &Engine, mut request: Request, route: Route, context: Cont
         };
         match route.operation.as_str() {
             "create" => {
+                // a cross-site form can post text/plain without a CORS preflight, not this type
+                let media = header("Content-Type");
+                if !media
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("application/json")
+                {
+                    return Err(Error::new(
+                        415,
+                        "CONTENT_TYPE",
+                        "Upload metadata must be sent as application/json",
+                    ));
+                }
                 let key = header("Idempotency-Key");
                 let mut bytes = vec![];
                 request.as_reader().take(65537).read_to_end(&mut bytes)?;

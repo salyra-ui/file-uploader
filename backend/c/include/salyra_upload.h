@@ -42,6 +42,9 @@ typedef struct {
   int (*authorize)(const char *, const char *, void *, upload_error *);
   int (*validate)(const char *, void *, upload_error *);
   void (*notify)(const char *, const char *, const char *, void *);
+  /* Without authorize anyone who reaches the routes can create, read and finish uploads:
+     upload_engine_new returns NULL unless this is set (local demos, tests). */
+  int allow_anonymous;
 } upload_options;
 typedef struct upload_engine upload_engine;
 char *upload_copy(const char *text);
