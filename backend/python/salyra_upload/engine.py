@@ -5,6 +5,12 @@ import time
 from typing import Protocol, BinaryIO, ContextManager, Any
 
 
+def chunk_lock(identifier, index):
+    """The lock of one chunk number. Session IDs are hex digests, so a key with a "-part-"
+    suffix is never another session's ID."""
+    return f"{identifier}-part-{index}"
+
+
 class UploadError(Exception):
     def __init__(self, status, code, message):
         super().__init__(message)
@@ -211,6 +217,31 @@ class UploadEngine:
             return result
 
     def receive_part(self, identifier, index, checksum, body, context=None):
+        """Holds the session lock only to check and to record. The body streams outside it,
+        under a lock of its own per chunk number taken from the same store, so chunks of one
+        upload arrive side by side and a slow one blocks nobody."""
+        session, part, existing = self._plan_part(identifier, index, checksum, context)
+        if existing:
+            return self._verify_part(existing, part, body)
+        with self.sessions.lock(chunk_lock(identifier, index)):
+            # another request may have stored this chunk number while this one waited
+            current = self.sessions.get(identifier)
+            stored = next(
+                (p for p in (current or {}).get("parts", []) if p["index"] == index),
+                None,
+            )
+            if stored:
+                return self._verify_part(stored, part, body)
+            saved = self.storage.write_part(session, part, body, context)
+            if any(saved.get(key) != part[key] for key in ("index", "size", "sha256")):
+                raise UploadError(
+                    500, "STORAGE_RECEIPT", "Storage returned an invalid receipt"
+                )
+            self._record_part(identifier, saved, context)
+            return {key: saved[key] for key in ("index", "size", "sha256")}
+
+    def _plan_part(self, identifier, index, checksum, context):
+        # validates under the session lock; the last value is the recorded chunk, if any
         with self.sessions.lock(identifier):
             session = self._get(identifier, "part", context)
             if session["state"] != "open":
@@ -233,14 +264,45 @@ class UploadEngine:
                 ),
                 "sha256": checksum,
             }
-            saved = self.storage.write_part(session, part, body, context)
+            existing = next((p for p in session["parts"] if p["index"] == index), None)
+            return session, part, existing
+
+    @staticmethod
+    def _verify_part(existing, part, body):
+        # a retransmitted body is consumed and checked: a matching header does not prove
+        # matching content
+        digest, size = hashlib.sha256(), 0
+        while data := body.read(min(65536, part["size"] - size + 1)):
+            size += len(data)
+            if size > part["size"]:
+                raise UploadError(413, "PART_SIZE", "Chunk exceeds expected size")
+            digest.update(data)
+        if (
+            size != part["size"]
+            or digest.hexdigest() != existing["sha256"]
+            or part["sha256"] != existing["sha256"]
+        ):
+            raise UploadError(409, "PART_CONFLICT", "Chunk contains different data")
+        return {key: existing[key] for key in ("index", "size", "sha256")}
+
+    def _record_part(self, identifier, saved, context):
+        # The session is read again: it may have been canceled or expired while the body
+        # streamed, and other chunks may have been recorded meanwhile.
+        with self.sessions.lock(identifier):
+            session = self._get(identifier, "part", context)
+            if session["state"] != "open":
+                raise UploadError(409, "STATE", "Upload does not accept chunks")
+            if any(p["index"] == saved["index"] for p in session["parts"]):
+                return
             session["parts"] = sorted(
-                [p for p in session["parts"] if p["index"] != index] + [saved],
-                key=lambda p: p["index"],
+                session["parts"] + [saved], key=lambda p: p["index"]
+            )
+            # progress keeps a long upload alive: the TTL counts inactivity
+            session["expiresAt"] = max(
+                session["expiresAt"], int((time.time() + self.ttl) * 1000)
             )
             self.sessions.save(session)
             self._notify("part-stored", session, context, saved)
-            return {key: saved[key] for key in ("index", "size", "sha256")}
 
     def finish_upload(self, identifier, context=None):
         with self.sessions.lock(identifier):

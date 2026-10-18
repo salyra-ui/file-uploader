@@ -6,7 +6,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from contextlib import contextmanager
-from .engine import UploadError
+from .engine import UploadError, chunk_lock
 
 
 def safe(identifier):
@@ -69,6 +69,15 @@ class DiskSessions:
 
     def save(self, session):
         atomic_json(self.directory / (safe(session["id"]) + ".json"), session)
+        if session.get("state") in ("completed", "canceled", "expired"):
+            # Nothing is received for a finished upload any more: its chunk locks can go. A
+            # chunk request still streaming is refused at its record.
+            descriptor = session["descriptor"]
+            count = max(1, -(-descriptor["size"] // max(1, descriptor["chunkSize"])))
+            for index in range(count):
+                (self.directory / (chunk_lock(session["id"], index) + ".lock")).unlink(
+                    missing_ok=True
+                )
 
     def list(self):
         return [json.loads(path.read_text()) for path in self.directory.glob("*.json")]
