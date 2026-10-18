@@ -437,17 +437,24 @@ static long checked_read(void *data, unsigned char *buffer, size_t capacity) {
   body->done = 1;
   return 0;
 }
-int upload_part(upload_engine *engine, const char *id, int index,
-                const char *checksum, upload_read source, void *body,
-                void *context, char **result, upload_error *error) {
-  *result = NULL;
+/* What the first, locked step of a part learned: the session as it was, the
+ * requested part, and a copy of the recorded chunk with this number (NULL when
+ * there is none). */
+struct part_plan {
+  cJSON *session, *part, *existing;
+  uint64_t expected;
+};
+static int plan_part(upload_engine *engine, const char *id, int index,
+                     const char *checksum, upload_read source, void *context,
+                     struct part_plan *plan, upload_error *error) {
+  memset(plan, 0, sizeof(*plan));
   void *lease = NULL;
-  cJSON *session = NULL;
-  int status = start(engine, id, "part", context, &lease, &session, error);
+  int status =
+      start(engine, id, "part", context, &lease, &plan->session, error);
   if (status)
     return status;
-  cJSON *d = cJSON_GetObjectItemCaseSensitive(session, "descriptor"), *p = NULL;
-  if (strcmp(u_string(session, "state"), "open")) {
+  cJSON *d = cJSON_GetObjectItemCaseSensitive(plan->session, "descriptor");
+  if (strcmp(u_string(plan->session, "state"), "open")) {
     status = u_error(error, 409, "STATE", "Upload does not accept chunks");
     goto done;
   }
@@ -457,20 +464,163 @@ int upload_part(upload_engine *engine, const char *id, int index,
     goto done;
   }
   uint64_t chunk = (uint64_t)u_number(d, "chunkSize"),
-           remaining = (uint64_t)u_number(d, "size") - (uint64_t)index * chunk,
-           expected = remaining < chunk ? remaining : chunk;
-  p = cJSON_CreateObject();
-  cJSON_AddNumberToObject(p, "index", index);
-  cJSON_AddNumberToObject(p, "size", (double)expected);
-  cJSON_AddStringToObject(p, "sha256", checksum);
-  char *session_json = u_json(session), *part_json = u_json(p), *receipt = NULL;
-  struct checked_body checked = {source,   body,  0, expected, EVP_MD_CTX_new(),
-                                 checksum, error, 0, 0};
-  if (!checked.hash) {
+           remaining = (uint64_t)u_number(d, "size") - (uint64_t)index * chunk;
+  plan->expected = remaining < chunk ? remaining : chunk;
+  plan->part = cJSON_CreateObject();
+  cJSON_AddNumberToObject(plan->part, "index", index);
+  cJSON_AddNumberToObject(plan->part, "size", (double)plan->expected);
+  cJSON_AddStringToObject(plan->part, "sha256", checksum);
+  cJSON *stored;
+  cJSON_ArrayForEach(stored,
+                     cJSON_GetObjectItemCaseSensitive(plan->session, "parts")) {
+    if (u_number(stored, "index") == index)
+      plan->existing = cJSON_Duplicate(stored, 1);
+  }
+done:
+  engine->options.sessions.unlock(engine->options.sessions.data, lease);
+  if (status) {
+    cJSON_Delete(plan->session);
+    cJSON_Delete(plan->part);
+    cJSON_Delete(plan->existing);
+    memset(plan, 0, sizeof(*plan));
+  }
+  return status;
+}
+/* A retransmitted body is consumed and checked: a matching header does not
+ * prove matching content. */
+static int verify_part(const cJSON *existing, const char *checksum,
+                       uint64_t expected, upload_read source, void *body,
+                       char **result, upload_error *error) {
+  EVP_MD_CTX *hash = EVP_MD_CTX_new();
+  if (!hash)
+    return u_error(error, 500, "MEMORY", "Allocation failed");
+  EVP_DigestInit_ex(hash, EVP_sha256(), NULL);
+  unsigned char buffer[65536];
+  uint64_t size = 0;
+  int status = 0;
+  for (;;) {
+    long got = source(body, buffer, sizeof(buffer));
+    if (got < 0) {
+      status = u_error(error, 400, "BODY", "Body read failed");
+      break;
+    }
+    if ((size_t)got > sizeof(buffer)) {
+      status = u_error(error, 500, "READER", "Reader exceeded buffer capacity");
+      break;
+    }
+    if (!got)
+      break;
+    size += (uint64_t)got;
+    if (size > expected) {
+      status = u_error(error, 413, "PART_SIZE", "Chunk exceeds expected size");
+      break;
+    }
+    EVP_DigestUpdate(hash, buffer, (size_t)got);
+  }
+  if (!status) {
+    unsigned char bytes[32];
+    unsigned int length;
+    char hex[65];
+    EVP_DigestFinal_ex(hash, bytes, &length);
+    u_hex(bytes, 32, hex);
+    const char *recorded = u_string(existing, "sha256");
+    if (size != expected || strcmp(hex, recorded) ||
+        strcmp(checksum, recorded)) {
+      status =
+          u_error(error, 409, "PART_CONFLICT", "Chunk contains different data");
+    } else {
+      cJSON *reply = cJSON_Duplicate(existing, 1);
+      cJSON_DeleteItemFromObjectCaseSensitive(reply, "reference");
+      *result = u_json(reply);
+      cJSON_Delete(reply);
+    }
+  }
+  EVP_MD_CTX_free(hash);
+  return status;
+}
+/* Stores a written chunk in the session under the session lock. The session is
+ * read again: it may have been canceled or expired while the body streamed, and
+ * other chunks may have been recorded meanwhile. */
+static int record_part(upload_engine *engine, const char *id,
+                       const cJSON *saved, void *context, upload_error *error) {
+  void *lease = NULL;
+  cJSON *session = NULL;
+  int status = start(engine, id, "part", context, &lease, &session, error);
+  if (status)
+    return status;
+  if (strcmp(u_string(session, "state"), "open")) {
+    status = u_error(error, 409, "STATE", "Upload does not accept chunks");
+    goto done;
+  }
+  int64_t index = u_number(saved, "index");
+  cJSON *parts = cJSON_GetObjectItemCaseSensitive(session, "parts"), *item,
+        *merged = cJSON_CreateArray();
+  int placed = 0;
+  cJSON_ArrayForEach(item, parts) {
+    if (u_number(item, "index") == index) {
+      cJSON_Delete(merged);
+      goto done; /* recorded meanwhile */
+    }
+  }
+  /* the chunk goes in at its place in index order */
+  while ((item = cJSON_DetachItemFromArray(parts, 0))) {
+    if (!placed && index < u_number(item, "index")) {
+      cJSON_AddItemToArray(merged, cJSON_Duplicate(saved, 1));
+      placed = 1;
+    }
+    cJSON_AddItemToArray(merged, item);
+  }
+  if (!placed)
+    cJSON_AddItemToArray(merged, cJSON_Duplicate(saved, 1));
+  replace(session, "parts", merged);
+  /* progress keeps a long upload alive: the TTL counts inactivity */
+  uint64_t renewed = now() + engine->options.ttl_milliseconds;
+  if (renewed > (uint64_t)u_number(session, "expiresAt"))
+    replace(session, "expiresAt", cJSON_CreateNumber((double)renewed));
+  status = save(engine, session, error);
+  if (!status && engine->options.notify) {
+    char event[160];
+    snprintf(event, sizeof(event), "%s:part-stored:%d", id, (int)index);
+    char *json = u_json(session);
+    engine->options.notify(event, "part-stored", json, context);
+    free(json);
+  }
+done:
+  cJSON_Delete(session);
+  engine->options.sessions.unlock(engine->options.sessions.data, lease);
+  return status;
+}
+/* The step of a part that runs under the chunk lock. */
+static int store_part(upload_engine *engine, const char *id, int index,
+                      const char *checksum, const struct part_plan *plan,
+                      upload_read source, void *body, void *context,
+                      char **result, upload_error *error) {
+  /* another request may have stored this chunk number while this one waited */
+  char *current = NULL;
+  int status = engine->options.sessions.get(engine->options.sessions.data, id,
+                                            &current, error);
+  if (status)
+    return status;
+  cJSON *record = current ? cJSON_Parse(current) : NULL, *item;
+  free(current);
+  cJSON_ArrayForEach(item, cJSON_GetObjectItemCaseSensitive(record, "parts")) {
+    if (u_number(item, "index") == index) {
+      status = verify_part(item, checksum, plan->expected, source, body, result,
+                           error);
+      cJSON_Delete(record);
+      return status;
+    }
+  }
+  cJSON_Delete(record);
+  char *session_json = u_json(plan->session), *part_json = u_json(plan->part),
+       *receipt = NULL;
+  struct checked_body checked = {source,   body,  0, plan->expected,
+                                 EVP_MD_CTX_new(), checksum, error, 0, 0};
+  if (!checked.hash || !session_json || !part_json) {
+    EVP_MD_CTX_free(checked.hash);
     free(session_json);
     free(part_json);
-    status = u_error(error, 500, "MEMORY", "Allocation failed");
-    goto done;
+    return u_error(error, 500, "MEMORY", "Allocation failed");
   }
   EVP_DigestInit_ex(checked.hash, EVP_sha256(), NULL);
   status = engine->options.storage.write_part(
@@ -486,40 +636,56 @@ int upload_part(upload_engine *engine, const char *id, int index,
   free(part_json);
   if (status) {
     free(receipt);
-    goto done;
+    return status;
   }
   cJSON *saved = cJSON_Parse(receipt);
   free(receipt);
   if (!cJSON_IsObject(saved) || u_number(saved, "index") != index ||
-      u_number(saved, "size") != (int64_t)expected ||
+      u_number(saved, "size") != (int64_t)plan->expected ||
       strcmp(u_string(saved, "sha256"), checksum)) {
     cJSON_Delete(saved);
-    status = u_error(error, 500, "STORAGE_RECEIPT", "Invalid storage receipt");
-    goto done;
+    return u_error(error, 500, "STORAGE_RECEIPT", "Invalid storage receipt");
   }
-  cJSON *parts = cJSON_GetObjectItemCaseSensitive(session, "parts");
-  for (int i = cJSON_GetArraySize(parts) - 1; i >= 0; i--)
-    if (u_number(cJSON_GetArrayItem(parts, i), "index") == index)
-      cJSON_DeleteItemFromArray(parts, i);
-  cJSON_AddItemToArray(parts, saved);
-  status = save(engine, session, error);
+  status = record_part(engine, id, saved, context, error);
   if (!status) {
-    if (engine->options.notify) {
-      char event[160];
-      snprintf(event, sizeof(event), "%s:part-stored:%d", id, index);
-      char *json = u_json(session);
-      engine->options.notify(event, "part-stored", json, context);
-      free(json);
-    }
-    cJSON *reply = cJSON_Duplicate(saved, 1);
-    cJSON_DeleteItemFromObjectCaseSensitive(reply, "reference");
-    *result = u_json(reply);
-    cJSON_Delete(reply);
+    cJSON_DeleteItemFromObjectCaseSensitive(saved, "reference");
+    *result = u_json(saved);
   }
-done:
-  cJSON_Delete(p);
-  cJSON_Delete(session);
-  engine->options.sessions.unlock(engine->options.sessions.data, lease);
+  cJSON_Delete(saved);
+  return status;
+}
+/* Holds the session lock only to check and to record. The body streams outside
+ * it, under a lock of its own per chunk number taken from the same store (key
+ * "<id>-part-<index>"; session IDs are hex digests, so it is never another
+ * session's ID), so chunks of one upload arrive side by side and a slow one
+ * blocks nobody. */
+int upload_part(upload_engine *engine, const char *id, int index,
+                const char *checksum, upload_read source, void *body,
+                void *context, char **result, upload_error *error) {
+  *result = NULL;
+  struct part_plan plan;
+  int status =
+      plan_part(engine, id, index, checksum, source, context, &plan, error);
+  if (status)
+    return status;
+  if (plan.existing) {
+    status = verify_part(plan.existing, checksum, plan.expected, source, body,
+                         result, error);
+  } else {
+    char key[160];
+    void *chunk = NULL;
+    snprintf(key, sizeof(key), "%s-part-%d", id, index);
+    status = engine->options.sessions.lock(engine->options.sessions.data, key,
+                                           &chunk, error);
+    if (!status) {
+      status = store_part(engine, id, index, checksum, &plan, source, body,
+                          context, result, error);
+      engine->options.sessions.unlock(engine->options.sessions.data, chunk);
+    }
+  }
+  cJSON_Delete(plan.session);
+  cJSON_Delete(plan.part);
+  cJSON_Delete(plan.existing);
   return status;
 }
 int upload_finish(upload_engine *engine, const char *id, void *context,

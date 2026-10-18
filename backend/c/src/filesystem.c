@@ -182,12 +182,38 @@ static int get_session(void *data, const char *id, char **out,
       path(data, filename, sizeof(filename), "sessions", id, ".json", error);
   return status ? status : read_json(filename, out, error);
 }
+/* Nothing is received for a finished upload any more: its chunk locks can go. A
+ * chunk request still streaming is refused at its record. */
+static void drop_chunk_locks(void *data, const char *json) {
+  cJSON *session = cJSON_Parse(json);
+  const char *state = u_string(session, "state");
+  cJSON *descriptor = cJSON_GetObjectItemCaseSensitive(session, "descriptor");
+  int64_t size = u_number(descriptor, "size"),
+          chunk = u_number(descriptor, "chunkSize");
+  if (chunk >= 1 && size >= 0 &&
+      (!strcmp(state, "completed") || !strcmp(state, "canceled") ||
+       !strcmp(state, "expired"))) {
+    int64_t count = (size + chunk - 1) / chunk;
+    for (int64_t index = 0; index < (count ? count : 1); index++) {
+      char key[160], filename[4096];
+      snprintf(key, sizeof(key), "%s-part-%lld", u_string(session, "id"),
+               (long long)index);
+      if (!path(data, filename, sizeof(filename), "locks", key, ".lock", NULL))
+        unlink(filename);
+    }
+  }
+  cJSON_Delete(session);
+}
 static int put_session(void *data, const char *id, const char *json,
                        upload_error *error) {
   char filename[4096];
   int status =
       path(data, filename, sizeof(filename), "sessions", id, ".json", error);
-  return status ? status : atomic(filename, json, error);
+  if (!status)
+    status = atomic(filename, json, error);
+  if (!status)
+    drop_chunk_locks(data, json);
+  return status;
 }
 static int part_path(upload_disk *disk, const cJSON *session, int index,
                      const char *suffix, char out[4096], upload_error *error) {

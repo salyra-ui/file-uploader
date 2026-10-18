@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 /* A localhost example, not an HTTP framework. Applications call upload_* from
- * their own routes. */
+ * their own routes. Each connection has a thread (at most MAX_CLIENTS at once),
+ * so the chunks of one upload are received side by side. */
 #include "salyra_upload.h"
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,6 +184,30 @@ static void request(upload_engine *engine, int socket) {
     respond(socket, 200, result ? result : "null");
   upload_free(result);
 }
+#define MAX_CLIENTS 32
+static pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t client_left = PTHREAD_COND_INITIALIZER;
+static int clients;
+struct client {
+  upload_engine *engine;
+  int socket;
+};
+static void *serve(void *data) {
+  struct client *client = data;
+  struct timeval timeout = {30, 0};
+  setsockopt(client->socket, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+             sizeof(timeout));
+  setsockopt(client->socket, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+             sizeof(timeout));
+  request(client->engine, client->socket);
+  close(client->socket);
+  free(client);
+  pthread_mutex_lock(&clients_lock);
+  clients--;
+  pthread_cond_signal(&client_left);
+  pthread_mutex_unlock(&clients_lock);
+  return NULL;
+}
 int main(void) {
   const char *root = getenv("UPLOAD_DIRECTORY");
   upload_disk *disk = upload_disk_new(root ? root : "/tmp/salyra-c-uploads");
@@ -204,7 +230,7 @@ int main(void) {
   const char *host = getenv("HOST");
   inet_pton(AF_INET, host ? host : "127.0.0.1", &address.sin_addr);
   if (bind(server, (struct sockaddr *)&address, sizeof(address)) ||
-      listen(server, 16))
+      listen(server, 64))
     return 1;
   for (;;) {
     int client = accept(server, NULL, NULL);
@@ -213,11 +239,26 @@ int main(void) {
         continue;
       break;
     }
-    struct timeval timeout = {30, 0};
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    request(engine, client);
-    close(client);
+    struct client *connection = malloc(sizeof(*connection));
+    pthread_t thread;
+    pthread_mutex_lock(&clients_lock);
+    while (clients >= MAX_CLIENTS)
+      pthread_cond_wait(&client_left, &clients_lock);
+    clients++;
+    pthread_mutex_unlock(&clients_lock);
+    if (connection) {
+      connection->engine = engine;
+      connection->socket = client;
+    }
+    if (!connection || pthread_create(&thread, NULL, serve, connection)) {
+      close(client);
+      free(connection);
+      pthread_mutex_lock(&clients_lock);
+      clients--;
+      pthread_mutex_unlock(&clients_lock);
+      continue;
+    }
+    pthread_detach(thread);
   }
   close(server);
   upload_engine_free(engine);
