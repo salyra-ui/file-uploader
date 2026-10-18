@@ -51,6 +51,18 @@ module SalyraUpload
     end
     def save(session)
       Disk.atomic(File.join(@directory, Disk.safe(session['id']) + '.json'), session)
+      drop_chunk_locks(session) if %w[completed canceled expired].include?(session['state'])
+    end
+
+    private
+
+    # Nothing is received for a finished upload any more: its chunk locks can go. A chunk request
+    # still streaming is refused at its record.
+    def drop_chunk_locks(session)
+      descriptor = session['descriptor']
+      return unless descriptor['chunkSize'].to_i.positive?
+      count = [1, (descriptor['size'] + descriptor['chunkSize'] - 1) / descriptor['chunkSize']].max
+      count.times { |index| FileUtils.rm_f(File.join(@directory, SalyraUpload.chunk_lock(session['id'], index) + '.lock')) }
     end
   end
   class DiskStorage

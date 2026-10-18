@@ -1,6 +1,12 @@
 require 'json'
 require 'digest'
 module SalyraUpload
+  # The lock of one chunk number. Session IDs are hex digests, so a key with a "-part-" suffix is
+  # never another session's ID.
+  def self.chunk_lock(identifier, index)
+    "#{identifier}-part-#{index}"
+  end
+
   class UploadError < StandardError
     attr_reader :status, :code
     def initialize(status, code, message)
@@ -104,19 +110,21 @@ module SalyraUpload
         result
       end
     end
+    # Holds the session lock only to check and to record. The body streams outside it, under a
+    # lock of its own per chunk number taken from the same store, so chunks of one upload arrive
+    # side by side and a slow one blocks nobody.
     def receive_part(identifier, index, checksum, body, context = nil)
-      sessions.transaction(identifier) do
-        session = get(identifier, 'part', context)
-        raise UploadError.new(409, 'STATE', 'Upload does not accept chunks') unless session['state'] == 'open'
-        descriptor = session['descriptor']
-        unless index.is_a?(Integer) && index.between?(0, count(descriptor) - 1) && checksum.match?(/\A[a-f0-9]{64}\z/)
-          raise UploadError.new(400, 'PART', 'Invalid chunk or checksum')
-        end
-        part = { 'index' => index, 'size' => [descriptor['chunkSize'], descriptor['size'] - index * descriptor['chunkSize']].min, 'sha256' => checksum }
+      session, part, existing = plan_part(identifier, index, checksum, context)
+      return verify_part(existing, part, body) if existing
+      sessions.transaction(SalyraUpload.chunk_lock(identifier, index)) do
+        # another request may have stored this chunk number while this one waited
+        stored = sessions.get(identifier)&.fetch('parts', [])&.find { |p| p['index'] == index }
+        next verify_part(stored, part, body) if stored
         saved = storage.write_part(session, part, body, context)
-        session['parts'] = (session['parts'].reject { |p| p['index'] == index } + [saved]).sort_by { |p| p['index'] }
-        sessions.save(session)
-        notify('part-stored', session, context, saved)
+        unless %w[index size sha256].all? { |key| saved[key] == part[key] }
+          raise UploadError.new(500, 'STORAGE_RECEIPT', 'Storage returned an invalid receipt')
+        end
+        record_part(identifier, saved, context)
         saved.slice('index', 'size', 'sha256')
       end
     end
@@ -153,6 +161,51 @@ module SalyraUpload
         sessions.save(session)
         notify('canceled', session, context)
         nil
+      end
+    end
+
+    private
+
+    # Validates under the session lock; the last value is the recorded chunk with this number.
+    def plan_part(identifier, index, checksum, context)
+      sessions.transaction(identifier) do
+        session = get(identifier, 'part', context)
+        raise UploadError.new(409, 'STATE', 'Upload does not accept chunks') unless session['state'] == 'open'
+        descriptor = session['descriptor']
+        unless index.is_a?(Integer) && index.between?(0, count(descriptor) - 1) && checksum.match?(/\A[a-f0-9]{64}\z/)
+          raise UploadError.new(400, 'PART', 'Invalid chunk or checksum')
+        end
+        part = { 'index' => index, 'size' => [descriptor['chunkSize'], descriptor['size'] - index * descriptor['chunkSize']].min, 'sha256' => checksum }
+        [session, part, session['parts'].find { |p| p['index'] == index }]
+      end
+    end
+
+    # A retransmitted body is consumed and checked: a matching header does not prove matching content.
+    def verify_part(existing, part, body)
+      digest, size = Digest::SHA256.new, 0
+      while (data = body.read(65_536)) && !data.empty?
+        size += data.bytesize
+        raise UploadError.new(413, 'PART_SIZE', 'Chunk exceeds expected size') if size > part['size']
+        digest.update(data)
+      end
+      if size != part['size'] || digest.hexdigest != existing['sha256'] || part['sha256'] != existing['sha256']
+        raise UploadError.new(409, 'PART_CONFLICT', 'Chunk contains different data')
+      end
+      existing.slice('index', 'size', 'sha256')
+    end
+
+    # The session is read again: it may have been canceled or expired while the body streamed,
+    # and other chunks may have been recorded meanwhile.
+    def record_part(identifier, saved, context)
+      sessions.transaction(identifier) do
+        session = get(identifier, 'part', context)
+        raise UploadError.new(409, 'STATE', 'Upload does not accept chunks') unless session['state'] == 'open'
+        next if session['parts'].any? { |p| p['index'] == saved['index'] }
+        session['parts'] = (session['parts'] + [saved]).sort_by { |p| p['index'] }
+        # progress keeps a long upload alive: the TTL counts inactivity
+        session['expiresAt'] = [session['expiresAt'], ((Time.now.to_f + @ttl) * 1000).to_i].max
+        sessions.save(session)
+        notify('part-stored', session, context, saved)
       end
     end
   end
