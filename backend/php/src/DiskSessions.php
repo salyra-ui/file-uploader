@@ -9,5 +9,12 @@ final class DiskSessions implements SessionStore {
     }
     public function transaction(string $id, callable $operation): mixed { $stream=fopen($this->directory.'/'.self::safe($id).'.lock','c'); if (!$stream) throw new \RuntimeException('Could not open lock'); try { if (!flock($stream, LOCK_EX)) throw new \RuntimeException('Could not acquire lock'); return $operation(); } finally { flock($stream, LOCK_UN); fclose($stream); } }
     public function get(string $id): ?array { $path=$this->directory.'/'.self::safe($id).'.json'; return file_exists($path)?json_decode(file_get_contents($path),true,512,JSON_THROW_ON_ERROR):null; }
-    public function save(array $session): void { self::atomic($this->directory.'/'.self::safe($session['id']).'.json', $session); }
+    public function save(array $session): void {
+        self::atomic($this->directory.'/'.self::safe($session['id']).'.json', $session);
+        // Nothing is received for a finished upload any more: its chunk locks can go. A chunk request still streaming is refused at its record.
+        if (in_array($session['state'] ?? '', ['completed', 'canceled', 'expired'], true) && ($session['descriptor']['chunkSize'] ?? 0) >= 1) {
+            $count=max(1, intdiv($session['descriptor']['size']+$session['descriptor']['chunkSize']-1, $session['descriptor']['chunkSize']));
+            for ($index=0; $index<$count; $index++) @unlink($this->directory.'/'.UploadEngine::chunkLock($session['id'], $index).'.lock');
+        }
+    }
 }
