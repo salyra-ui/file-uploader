@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -70,10 +72,10 @@ type Options struct {
 	Authorize                 func(context.Context, string, *Session) error
 	// Without Authorize, anyone who can reach the routes can create, read and finish uploads:
 	// New refuses that unless AllowAnonymous is set (local demos, tests).
-	AllowAnonymous bool
-	Validate                  func(context.Context, Descriptor) error
-	Notify                    func(context.Context, string, *Session, *Part) error
-	OnNotificationError       func(error)
+	AllowAnonymous      bool
+	Validate            func(context.Context, Descriptor) error
+	Notify              func(context.Context, string, *Session, *Part) error
+	OnNotificationError func(error)
 }
 type Engine struct{ Options Options }
 
@@ -236,18 +238,67 @@ func (e *Engine) GetUpload(ctx context.Context, id string) (*Session, error) {
 	err = e.reconcile(ctx, s)
 	return s, err
 }
+
+// ReceivePart holds the session lock only to check and to record. The body streams outside it,
+// under a lock of its own per chunk number, so chunks of one upload arrive side by side and a
+// slow one blocks nobody. The chunk lock lives in the same store as the session lock, under the
+// key "<id>-part-<index>".
 func (e *Engine) ReceivePart(ctx context.Context, id string, index int, checksum string, body io.Reader) (Part, error) {
-	unlock, err := e.Options.Sessions.Lock(ctx, id)
+	p, snapshot, existing, err := e.planPart(ctx, id, index, checksum)
 	if err != nil {
 		return Part{}, err
+	}
+	if existing != nil {
+		return verifyPart(ctx, *existing, p, body)
+	}
+	release, err := e.Options.Sessions.Lock(ctx, chunkLock(id, index))
+	if err != nil {
+		return Part{}, err
+	}
+	defer release()
+	// another request may have stored this chunk number while this one waited
+	current, err := e.Options.Sessions.Get(ctx, id)
+	if err != nil {
+		return Part{}, err
+	}
+	if current != nil {
+		for _, old := range current.Parts {
+			if old.Index == index {
+				return verifyPart(ctx, old, p, body)
+			}
+		}
+	}
+	saved, err := e.Options.Storage.WritePart(ctx, snapshot, p, body)
+	if err != nil {
+		return Part{}, err
+	}
+	if saved.Index != index || saved.Size != p.Size || saved.SHA256 != p.SHA256 {
+		return Part{}, fail(500, "STORAGE_RECEIPT", "Storage returned an invalid receipt")
+	}
+	if err = e.recordPart(ctx, id, saved); err != nil {
+		return Part{}, err
+	}
+	return saved, nil
+}
+
+// chunkLock names the lock of one chunk number. Session IDs are hex digests, so a key with a
+// "-part-" suffix is never another session's ID.
+func chunkLock(id string, index int) string { return id + "-part-" + strconv.Itoa(index) }
+
+// planPart validates the request under the session lock. existing is the recorded chunk with
+// this number, if any.
+func (e *Engine) planPart(ctx context.Context, id string, index int, checksum string) (Part, *Session, *Part, error) {
+	unlock, err := e.Options.Sessions.Lock(ctx, id)
+	if err != nil {
+		return Part{}, nil, nil, err
 	}
 	defer unlock()
 	s, err := e.get(ctx, id, "part")
 	if err != nil {
-		return Part{}, err
+		return Part{}, nil, nil, err
 	}
 	if s.State != "open" {
-		return Part{}, fail(409, "STATE", "Upload does not accept chunks")
+		return Part{}, nil, nil, fail(409, "STATE", "Upload does not accept chunks")
 	}
 	count := (s.Descriptor.Size + s.Descriptor.ChunkSize - 1) / s.Descriptor.ChunkSize
 	if count < 1 {
@@ -255,31 +306,71 @@ func (e *Engine) ReceivePart(ctx context.Context, id string, index int, checksum
 	}
 	decoded, err := hex.DecodeString(checksum)
 	if err != nil || len(decoded) != 32 || strings.ToLower(checksum) != checksum || index < 0 || int64(index) >= count {
-		return Part{}, fail(400, "PART", "Invalid chunk or checksum")
+		return Part{}, nil, nil, fail(400, "PART", "Invalid chunk or checksum")
 	}
 	size := s.Descriptor.ChunkSize
 	if remaining := s.Descriptor.Size - int64(index)*size; remaining < size {
 		size = remaining
 	}
 	p := Part{Index: index, Size: size, SHA256: checksum}
-	saved, err := e.Options.Storage.WritePart(ctx, s, p, body)
+	for i := range s.Parts {
+		if s.Parts[i].Index == index {
+			old := s.Parts[i]
+			return p, s, &old, nil
+		}
+	}
+	return p, s, nil, nil
+}
+
+// verifyPart consumes a retransmitted body and compares it with the recorded chunk. A matching
+// header does not prove matching content.
+func verifyPart(ctx context.Context, old, p Part, body io.Reader) (Part, error) {
+	hash := sha256.New()
+	n, err := io.Copy(hash, io.LimitReader(contextReader{ctx, body}, p.Size+1))
 	if err != nil {
 		return Part{}, err
 	}
+	if n > p.Size {
+		return Part{}, fail(413, "PART_SIZE", "Chunk exceeds expected size")
+	}
+	if n != p.Size || hex.EncodeToString(hash.Sum(nil)) != old.SHA256 || p.SHA256 != old.SHA256 {
+		return Part{}, fail(409, "PART_CONFLICT", "Chunk contains different data")
+	}
+	return old, nil
+}
+
+// recordPart stores a written chunk in the session under the session lock. The session is read
+// again: it may have been canceled or expired while the body streamed, and other chunks may
+// have been recorded meanwhile.
+func (e *Engine) recordPart(ctx context.Context, id string, saved Part) error {
+	unlock, err := e.Options.Sessions.Lock(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	s, err := e.get(ctx, id, "part")
+	if err != nil {
+		return err
+	}
+	if s.State != "open" {
+		return fail(409, "STATE", "Upload does not accept chunks")
+	}
 	for _, old := range s.Parts {
-		if old.Index == index {
-			if old.SHA256 != saved.SHA256 || old.Size != saved.Size {
-				return Part{}, fail(409, "PART_CONFLICT", "Chunk contains different data")
-			}
-			return old, nil
+		if old.Index == saved.Index {
+			return nil
 		}
 	}
 	s.Parts = append(s.Parts, saved)
+	sort.Slice(s.Parts, func(i, j int) bool { return s.Parts[i].Index < s.Parts[j].Index })
+	// progress keeps a long upload alive: the TTL counts inactivity
+	if renewed := time.Now().Add(e.Options.TTL).UnixMilli(); renewed > s.ExpiresAt {
+		s.ExpiresAt = renewed
+	}
 	if err = e.Options.Sessions.Save(ctx, s); err != nil {
-		return Part{}, err
+		return err
 	}
 	e.notify(ctx, "part-stored", s, &saved)
-	return saved, nil
+	return nil
 }
 func (e *Engine) FinishUpload(ctx context.Context, id string) (any, error) {
 	unlock, err := e.Options.Sessions.Lock(ctx, id)

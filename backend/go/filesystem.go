@@ -76,7 +76,25 @@ func (d DiskSessions) Save(ctx context.Context, s *Session) error {
 	if err := safe(s.ID); err != nil {
 		return err
 	}
-	return atomicJSON(filepath.Join(d.Directory, s.ID+".json"), s)
+	if err := atomicJSON(filepath.Join(d.Directory, s.ID+".json"), s); err != nil {
+		return err
+	}
+	if s.State == "completed" || s.State == "canceled" || s.State == "expired" {
+		d.dropChunkLocks(s)
+	}
+	return nil
+}
+
+// dropChunkLocks removes the lock files of a finished upload's chunk numbers. A chunk
+// request still streaming then is refused at its record, so the lock is no longer needed.
+func (d DiskSessions) dropChunkLocks(s *Session) {
+	if s.Descriptor.ChunkSize < 1 {
+		return
+	}
+	count := (s.Descriptor.Size + s.Descriptor.ChunkSize - 1) / s.Descriptor.ChunkSize
+	for i := int64(0); i < count || i == 0; i++ {
+		os.Remove(filepath.Join(d.Directory, chunkLock(s.ID, int(i))+".lock"))
+	}
 }
 func (d DiskSessions) List(ctx context.Context) ([]Session, error) {
 	entries, err := os.ReadDir(d.Directory)
