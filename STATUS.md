@@ -24,7 +24,7 @@ The browser and Node packages are built locally. Registry publication is a separ
 | TypeScript           | Browser engine, adapters, Node server, local examples and test scripts compile                                                                                                                                                       |
 | Frameworks           | Svelte and Astro compile, Angular partial compilation passes, React and Vue SSR isolate stores                                                                                                                                       |
 | Public recipes       | All 54 framework/example combinations parse or compile                                                                                                                                                                               |
-| Unit and fault cases | 68 tests pass, including interrupted responses, retry, persistence, cleanup, provider responses and per-item notification behavior                                                                                                   |
+| Unit and fault cases | 87 tests pass, including interrupted responses, retry, persistence, cleanup, provider responses and per-item notification behavior                                                                                                   |
 | Browser interaction  | 84 browser tests pass in Linux CI across Chromium, Firefox and WebKit against the real Node server, including five compiled framework adapters, refresh/reselect, completed-file deletion and Cancel → Retry across all compositions |
 | Documentation        | 30 tests pass across the existing component catalog, uploader guide, browser simulation, mobile layouts, downloads and immutable version links                                                                                       |
 | Package consumer     | Fresh installs of the actual npm archives compile with NodeNext and run without unrequested framework or provider peers. React, Vue and Angular adapter types also compile with their selected peers                                 |
@@ -73,7 +73,7 @@ Repeat the native command for rust, jvm, python, php, ruby, dotnet, elixir and c
 
 The encrypted 2 GiB HTTP transfer completed in 39.5 seconds locally and its decrypted SHA-256 matched the source. Combined client/server RSS rose from 88 MiB to 204 MiB, an additional 116 MiB. The benchmark limit is 384 MiB of additional RSS. These are measurements on this machine, not a throughput guarantee.
 
-The 22 new tests cover authenticated storage, tampering, receipt recovery, key rotation, canceled transfers, empty files, interrupted streams, request context and S3 encryption settings. Fresh archive consumers can import `/encryption` without installing the AWS SDK. Native engines keep their existing storage extension interfaces. Built-in encrypted disk storage is currently Node only.
+The 34 tests cover authenticated storage, tampering, sealed receipts (no plaintext digest in the adapter's directory, format 1 receipts still read), receipt recovery, key rotation, canceled transfers, empty files, interrupted streams, request context and S3 encryption settings. Fresh archive consumers can import `/encryption` without installing the AWS SDK. Native engines keep their existing storage extension interfaces. Built-in encrypted disk storage is currently Node only.
 
 ```sh
 SALYRA_STRESS_ENCRYPTED=1 node --import tsx scripts/stress.ts

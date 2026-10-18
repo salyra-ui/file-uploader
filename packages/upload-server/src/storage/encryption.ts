@@ -58,6 +58,8 @@ export interface EncryptedFilesystemStorage extends StorageAdapter {
   read(id: string, context?: unknown): Promise<Readable>;
 }
 const FORMAT = "salyra-aes256gcm/1" as const;
+/** Receipt files seal the plaintext SHA-256 of a part. Format 1 receipts held it in clear, with a MAC. */
+const RECEIPT_FORMAT = "salyra-receipt/2" as const;
 const FRAME = 64 * 1024;
 const MAGIC = Buffer.from("SLYRAE01");
 const MAX_CHUNK = 64 * 1024 * 1024;
@@ -183,6 +185,106 @@ function partSize(ref: Reference, index: number) {
   if (!Number.isInteger(index) || index < 0 || index >= count)
     throw failure("PART_INDEX", "Invalid encrypted part index");
   return Math.min(ref.chunkSize, Math.max(0, ref.size - index * ref.chunkSize));
+}
+/** A key of its own for receipts: the file key also keys the part keys and the format 1 receipt MAC. */
+function receiptKey(key: Buffer) {
+  return Buffer.from(
+    hkdfSync("sha256", key, Buffer.alloc(0), "salyra/receipt-key/2", 32),
+  );
+}
+function receiptAad(ref: Reference, index: number, size: number) {
+  return Buffer.from(
+    JSON.stringify([
+      RECEIPT_FORMAT,
+      ref.id,
+      ref.keyId,
+      ref.salt,
+      ref.size,
+      ref.chunkSize,
+      index,
+      size,
+    ]),
+  );
+}
+interface SealedReceipt {
+  format: typeof RECEIPT_FORMAT;
+  index: number;
+  size: number;
+  /** base64 of nonce (12 bytes), encrypted SHA-256 (32) and GCM tag (16). */
+  sealed: string;
+}
+/** AES-256-GCM with a fresh random nonce. The AAD binds the format, session, key, part index and size. */
+function sealReceipt(
+  part: StoredPart,
+  ref: Reference,
+  key: Buffer,
+): SealedReceipt {
+  if (!/^[a-f0-9]{64}$/.test(part.sha256))
+    throw failure("STORAGE_RECEIPT", "Invalid part checksum");
+  const derived = receiptKey(key),
+    iv = randomBytes(12);
+  try {
+    const cipher = createCipheriv("aes-256-gcm", derived, iv);
+    cipher.setAAD(receiptAad(ref, part.index, part.size));
+    const sealed = Buffer.concat([
+      iv,
+      cipher.update(Buffer.from(part.sha256, "hex")),
+      cipher.final(),
+      cipher.getAuthTag(),
+    ]);
+    return {
+      format: RECEIPT_FORMAT,
+      index: part.index,
+      size: part.size,
+      sealed: sealed.toString("base64"),
+    };
+  } finally {
+    derived.fill(0);
+  }
+}
+/** Returns the plaintext SHA-256 of the part, or fails authentication. */
+function openReceipt(
+  saved: Partial<SealedReceipt>,
+  ref: Reference,
+  index: number,
+  key: Buffer,
+): string {
+  const invalid = () =>
+    failure("ENCRYPTION_AUTH", "Encrypted receipt failed authentication");
+  if (
+    saved.index !== index ||
+    saved.size !== partSize(ref, index) ||
+    typeof saved.sealed !== "string" ||
+    !/^[A-Za-z0-9+/]{80}$/.test(saved.sealed)
+  )
+    throw invalid();
+  const bytes = Buffer.from(saved.sealed, "base64"),
+    derived = receiptKey(key);
+  try {
+    const cipher = createDecipheriv(
+      "aes-256-gcm",
+      derived,
+      bytes.subarray(0, 12),
+    );
+    cipher.setAAD(receiptAad(ref, index, saved.size));
+    cipher.setAuthTag(bytes.subarray(44));
+    return Buffer.concat([
+      cipher.update(bytes.subarray(12, 44)),
+      cipher.final(),
+    ]).toString("hex");
+  } catch {
+    throw invalid();
+  } finally {
+    derived.fill(0);
+  }
+}
+/** A committed upload needs no receipts: reading it authenticates its chunks by decrypting them. Dropping them leaves no part digest at rest, including receipts that format 1 wrote in clear. Best effort: what cannot be removed stays harmless. */
+async function dropReceipts(folder: string) {
+  try {
+    for (const name of await readdir(folder))
+      if (/^(0|[1-9]\d*)\.json$/.test(name))
+        await rm(join(folder, name), { force: true });
+  } catch {}
 }
 async function writeAll(handle: FileHandle, data: Buffer) {
   let offset = 0;
@@ -345,7 +447,8 @@ export function encryptedFilesystemStorage(
     }
     return validate(parsed);
   }
-  const receiptMac = (part: StoredPart, ref: Reference, key: Buffer) =>
+  /** Format 1 receipts: the plaintext digest in clear, authenticated by an HMAC under the file key. */
+  const legacyReceiptMac = (part: StoredPart, ref: Reference, key: Buffer) =>
     createHmac("sha256", key)
       .update(
         JSON.stringify([
@@ -367,10 +470,10 @@ export function encryptedFilesystemStorage(
     part: StoredPart,
     key: Buffer,
   ) {
-    await atomicJson(join(folder, `${part.index}.json`), {
-      ...part,
-      mac: receiptMac(part, ref, key).toString("hex"),
-    });
+    await atomicJson(
+      join(folder, `${part.index}.json`),
+      sealReceipt(part, ref, key),
+    );
   }
 
   async function savedReceipt(
@@ -383,41 +486,56 @@ export function encryptedFilesystemStorage(
     try {
       if ((await stat(path)).size > 4096)
         throw failure("ENCRYPTION_AUTH", "Invalid encrypted receipt");
-      let saved: StoredPart & { mac: string };
+      let saved: StoredPart & { mac?: string; format?: string };
       try {
         saved = JSON.parse(await readFile(path, "utf8"));
       } catch (error) {
         if (absent(error)) throw error;
         throw failure("ENCRYPTION_AUTH", "Invalid encrypted receipt");
       }
-      if (
-        !saved ||
-        saved.index !== index ||
-        saved.size !== partSize(ref, index) ||
-        !/^[a-f0-9]{64}$/.test(saved.sha256) ||
-        typeof saved.mac !== "string" ||
-        !/^[a-f0-9]{64}$/.test(saved.mac) ||
-        !timingSafeEqual(
-          receiptMac(saved, ref, key),
-          Buffer.from(saved.mac, "hex"),
-        )
-      )
-        throw failure(
-          "ENCRYPTION_AUTH",
-          "Encrypted receipt failed authentication",
+      const legacy = saved?.format !== RECEIPT_FORMAT;
+      let sha256: string;
+      if (!legacy)
+        sha256 = openReceipt(
+          saved as unknown as SealedReceipt,
+          ref,
+          index,
+          key,
         );
+      else {
+        if (
+          !saved ||
+          saved.index !== index ||
+          saved.size !== partSize(ref, index) ||
+          !/^[a-f0-9]{64}$/.test(saved.sha256) ||
+          typeof saved.mac !== "string" ||
+          !/^[a-f0-9]{64}$/.test(saved.mac) ||
+          !timingSafeEqual(
+            legacyReceiptMac(saved, ref, key),
+            Buffer.from(saved.mac, "hex"),
+          )
+        )
+          throw failure(
+            "ENCRYPTION_AUTH",
+            "Encrypted receipt failed authentication",
+          );
+        sha256 = saved.sha256;
+      }
       const frames = Math.max(1, Math.ceil(saved.size / FRAME));
       if (
         (await stat(pathFor(folder, index))).size !==
         40 + saved.size + frames * 16
       )
         throw failure("ENCRYPTION_AUTH", "Encrypted chunk size changed");
-      return {
+      const part: StoredPart = {
         index,
         size: saved.size,
-        sha256: saved.sha256,
+        sha256,
         reference: { format: FORMAT, index },
       };
+      // A verified format 1 receipt is rewritten sealed. Failing to is no reason to fail the read.
+      if (legacy) await saveReceipt(folder, ref, part, key).catch(() => {});
+      return part;
     } catch (error) {
       if (!absent(error)) throw error;
       const recovered = await receipt(pathFor(folder, index), ref, index, key);
@@ -605,6 +723,7 @@ export function encryptedFilesystemStorage(
         if (absent(error)) return { found: false };
         throw error;
       }
+      await dropReceipts(folder);
       return { found: true, result: await result(folder, ref, context) };
     },
     async finish(session, parts, context) {
@@ -633,6 +752,7 @@ export function encryptedFilesystemStorage(
         }
         await mkdir(join(root, "files"), { recursive: true, mode: 0o700 });
         await rename(folder, directory("files", ref.id));
+        await dropReceipts(directory("files", ref.id));
         return {
           id: ref.id,
           size: ref.size,
@@ -661,6 +781,7 @@ export function encryptedFilesystemStorage(
           "STORAGE_REFERENCE",
           "Encrypted destination belongs to another session",
         );
+      await dropReceipts(folder);
       // Resolve inside the generator so destroying an unread stream cannot leave a derived key alive.
       async function* contents() {
         const key = await keyFor(ref, context);

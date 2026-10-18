@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "vitest";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, hkdfSync, randomBytes } from "node:crypto";
 import {
   mkdtemp,
   readFile,
@@ -45,7 +45,11 @@ async function fixture(bytes = randomBytes(150000), chunkSize = 100000) {
     keys: ring,
   });
   const ledger = filesystemSessionStore(join(directory, "sessions"));
-  const engine = createUploadServer({ allowAnonymous: true, storage, sessionStore: ledger });
+  const engine = createUploadServer({
+    allowAnonymous: true,
+    storage,
+    sessionStore: ledger,
+  });
   const descriptor = {
     protocol: "salyra-upload/1" as const,
     name: "private.txt",
@@ -93,9 +97,15 @@ async function fixture(bytes = randomBytes(150000), chunkSize = 100000) {
     bytes,
   };
 }
-it("streams out-of-order chunks, preserves plaintext receipts and decrypts the completed upload", async () => {
+it("streams out-of-order chunks, still returns plaintext digests to the caller and decrypts the completed upload", async () => {
   const f = await fixture();
-  await f.upload();
+  const sent = await f.send(1);
+  expect(sent.sha256).toBe(digest(f.bytes.subarray(100000)));
+  expect((await f.engine.getUpload(f.created.id)).parts[0].sha256).toBe(
+    digest(f.bytes.subarray(100000)),
+  );
+  await f.send(0);
+  await f.engine.finishUpload(f.created.id);
   expect(await f.collect()).toEqual(f.bytes);
   const session = (await f.ledger.get(f.created.id))!;
   expect(session.result).toMatchObject({
@@ -128,7 +138,8 @@ it("pins a session key across process restart and key rotation", async () => {
     directory: join(f.directory, "content"),
     keys: f.ring,
   });
-  const engine = createUploadServer({ allowAnonymous: true,
+  const engine = createUploadServer({
+    allowAnonymous: true,
     storage: restarted,
     sessionStore: f.ledger,
   });
@@ -196,16 +207,315 @@ it("binds frames to their session and part positions", async () => {
   await copyFile(join(folder, "1.enc"), join(folder, "0.enc"));
   await expect(f.collect()).rejects.toMatchObject({ code: "ENCRYPTION_AUTH" });
 });
-it("rejects receipt tampering instead of skipping an untrusted chunk", async () => {
+const sealedPath = (f: Awaited<ReturnType<typeof fixture>>, index = 0) =>
+  join(f.directory, "content", "parts", f.created.id, `${index}.json`);
+/** Every file under a directory, recursively. */
+async function filesUnder(directory: string): Promise<string[]> {
+  const found: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true }))
+    found.push(
+      ...(entry.isDirectory()
+        ? await filesUnder(join(directory, entry.name))
+        : [join(directory, entry.name)]),
+    );
+  return found;
+}
+/** Files that hold the SHA-256 of any of the contents, as hex, base64 or raw bytes. */
+async function holdingDigests(directory: string, contents: Buffer[]) {
+  const holding: string[] = [];
+  for (const path of await filesUnder(directory)) {
+    const data = await readFile(path);
+    for (const content of contents) {
+      const sha = createHash("sha256").update(content).digest();
+      if (
+        data.includes(sha) ||
+        data.includes(sha.toString("hex")) ||
+        data.includes(sha.toString("base64"))
+      )
+        holding.push(path);
+    }
+  }
+  return holding;
+}
+/** A receipt as format 1 wrote it: the plaintext digest in clear and an HMAC under the file key. */
+async function writeLegacyReceipt(
+  f: Awaited<ReturnType<typeof fixture>>,
+  index: number,
+  folder = join(f.directory, "content", "parts", f.created.id),
+) {
+  const ref = JSON.parse(
+    await readFile(join(folder, "reference.json"), "utf8"),
+  );
+  const size = Math.min(
+    ref.chunkSize,
+    Math.max(0, ref.size - index * ref.chunkSize),
+  );
+  const sha256 = digest(
+    f.bytes.subarray(index * ref.chunkSize, index * ref.chunkSize + size),
+  );
+  const key = Buffer.from(
+    hkdfSync(
+      "sha256",
+      f.keys.get(ref.keyId)!,
+      Buffer.from(ref.salt, "base64"),
+      `salyra/storage/1/${ref.id}`,
+      32,
+    ),
+  );
+  const mac = createHmac("sha256", key)
+    .update(
+      JSON.stringify([
+        "salyra/receipt/1",
+        ref.id,
+        ref.keyId,
+        ref.salt,
+        ref.size,
+        ref.chunkSize,
+        index,
+        size,
+        sha256,
+      ]),
+    )
+    .digest("hex");
+  await writeFile(
+    join(folder, `${index}.json`),
+    JSON.stringify({
+      index,
+      size,
+      sha256,
+      reference: { format: "salyra-aes256gcm/1", index },
+      mac,
+    }),
+  );
+  return { index, size, sha256 };
+}
+it("keeps no plaintext digest in the storage directory, in progress or after completion", async () => {
+  const f = await fixture();
+  const contents = [
+    f.bytes.subarray(0, 100000),
+    f.bytes.subarray(100000),
+    f.bytes,
+  ];
+  const content = join(f.directory, "content");
+  await f.send(0);
+  const receipt = JSON.parse(await readFile(sealedPath(f), "utf8"));
+  expect(Object.keys(receipt).sort()).toEqual([
+    "format",
+    "index",
+    "sealed",
+    "size",
+  ]);
+  expect(receipt).toMatchObject({ format: "salyra-receipt/2", index: 0 });
+  expect(await holdingDigests(content, contents)).toEqual([]);
+  await f.send(1);
+  await f.engine.finishUpload(f.created.id);
+  expect(await holdingDigests(content, contents)).toEqual([]);
+  // a committed upload keeps its reference and its encrypted chunks, and no receipts
+  expect((await readdir(join(content, "files", f.created.id))).sort()).toEqual([
+    "0.enc",
+    "1.enc",
+    "reference.json",
+  ]);
+  // the session ledger belongs to the application and still holds the digests; this also
+  // shows that the scan above would find one
+  expect(
+    await holdingDigests(join(f.directory, "sessions"), [f.bytes]),
+  ).not.toEqual([]);
+});
+it("seals a receipt with a fresh nonce each time it is written", async () => {
   const f = await fixture();
   await f.send(0);
-  const path = join(f.directory, "content", "parts", f.created.id, "0.json");
-  const receipt = JSON.parse(await readFile(path, "utf8"));
-  receipt.sha256 = "0".repeat(64);
-  await writeFile(path, JSON.stringify(receipt));
+  const first = JSON.parse(await readFile(sealedPath(f), "utf8")).sealed;
+  await rm(sealedPath(f));
+  const session = (await f.ledger.get(f.created.id))!;
+  session.parts = [];
+  await f.ledger.put(session);
+  const recovered = (await f.engine.getUpload(f.created.id)).parts[0];
+  const second = JSON.parse(await readFile(sealedPath(f), "utf8")).sealed;
+  expect(recovered.sha256).toBe(digest(f.bytes.subarray(0, 100000)));
+  expect(second).not.toBe(first);
+});
+it("resumes from sealed receipts after a restart and a ledger that lost its parts", async () => {
+  const f = await fixture();
+  await f.send(1);
+  const session = (await f.ledger.get(f.created.id))!;
+  session.parts = [];
+  await f.ledger.put(session);
+  // a new adapter and engine over the same directories, as after a restart
+  const storage = encryptedFilesystemStorage({
+    directory: join(f.directory, "content"),
+    keys: f.ring,
+  });
+  const engine = createUploadServer({
+    allowAnonymous: true,
+    storage,
+    sessionStore: f.ledger,
+  });
+  const probed = await engine.getUpload(f.created.id);
+  expect(probed.parts).toEqual([
+    {
+      index: 1,
+      size: 50000,
+      sha256: digest(f.bytes.subarray(100000)),
+    },
+  ]);
+  // sending the saved chunk again is accepted from its receipt; a different body is not
+  expect(
+    (
+      await engine.receivePart(
+        f.created.id,
+        1,
+        digest(f.bytes.subarray(100000)),
+        Readable.from([f.bytes.subarray(100000)]),
+      )
+    ).sha256,
+  ).toBe(digest(f.bytes.subarray(100000)));
+  await expect(
+    engine.receivePart(
+      f.created.id,
+      1,
+      digest(Buffer.alloc(50000)),
+      Readable.from([Buffer.alloc(50000)]),
+    ),
+  ).rejects.toMatchObject({ code: "PART_CONFLICT" });
+  await engine.receivePart(
+    f.created.id,
+    0,
+    digest(f.bytes.subarray(0, 100000)),
+    Readable.from([f.bytes.subarray(0, 100000)]),
+  );
+  await engine.finishUpload(f.created.id);
+  expect(await f.collect()).toEqual(f.bytes);
+});
+const tampering: Array<
+  [string, (receipt: Record<string, any>, sealed: Buffer) => void]
+> = [
+  ["a flipped nonce bit", (_, sealed) => void (sealed[3] ^= 1)],
+  ["a flipped ciphertext bit", (_, sealed) => void (sealed[20] ^= 1)],
+  ["a flipped tag bit", (_, sealed) => void (sealed[50] ^= 1)],
+  ["another size", (receipt) => void (receipt.size -= 1)],
+  ["another index", (receipt) => void (receipt.index = 1)],
+  ["another format", (receipt) => void (receipt.format = "salyra-receipt/1")],
+];
+it.each(tampering)(
+  "rejects a sealed receipt with %s instead of skipping an untrusted chunk",
+  async (_, change) => {
+    const f = await fixture();
+    await f.send(0);
+    const receipt = JSON.parse(await readFile(sealedPath(f), "utf8"));
+    const sealed = Buffer.from(receipt.sealed, "base64");
+    change(receipt, sealed);
+    receipt.sealed = sealed.toString("base64");
+    await writeFile(sealedPath(f), JSON.stringify(receipt));
+    await expect(f.engine.getUpload(f.created.id)).rejects.toMatchObject({
+      code: "ENCRYPTION_AUTH",
+    });
+  },
+);
+it("rejects a truncated or malformed sealed receipt and a receipt moved to another part or session", async () => {
+  const f = await fixture(randomBytes(200000)),
+    other = await fixture(randomBytes(200000));
+  other.keys.set("v1", f.keys.get("v1")!);
+  await f.send(0);
+  await f.send(1);
+  await other.send(0);
+  const original = await readFile(sealedPath(f, 0), "utf8");
+  // another part's receipt as it is
+  await copyFile(sealedPath(f, 1), sealedPath(f, 0));
   await expect(f.engine.getUpload(f.created.id)).rejects.toMatchObject({
     code: "ENCRYPTION_AUTH",
   });
+  // another part's seal under this part's index and size: only the AAD tells them apart
+  await writeFile(
+    sealedPath(f, 0),
+    JSON.stringify({
+      ...JSON.parse(await readFile(sealedPath(f, 1), "utf8")),
+      index: 0,
+    }),
+  );
+  await expect(f.engine.getUpload(f.created.id)).rejects.toMatchObject({
+    code: "ENCRYPTION_AUTH",
+  });
+  // the receipt of another session that holds the same key
+  await copyFile(sealedPath(other, 0), sealedPath(f, 0));
+  await expect(f.engine.getUpload(f.created.id)).rejects.toMatchObject({
+    code: "ENCRYPTION_AUTH",
+  });
+  for (const damaged of [
+    JSON.stringify({ ...JSON.parse(original), sealed: "AAAA" }),
+    JSON.stringify({ ...JSON.parse(original), sealed: 7 }),
+    "{",
+  ]) {
+    await writeFile(sealedPath(f, 0), damaged);
+    await expect(f.engine.getUpload(f.created.id)).rejects.toMatchObject({
+      code: "ENCRYPTION_AUTH",
+    });
+  }
+  await writeFile(sealedPath(f, 0), original);
+  expect((await f.engine.getUpload(f.created.id)).parts).toHaveLength(2);
+  f.keys.set("v1", randomBytes(32));
+  await expect(f.engine.getUpload(f.created.id)).rejects.toMatchObject({
+    code: "ENCRYPTION_AUTH",
+  });
+});
+it("still reads a format 1 receipt and rewrites it sealed", async () => {
+  const f = await fixture();
+  await f.send(0);
+  const legacy = await writeLegacyReceipt(f, 0);
+  expect(JSON.parse(await readFile(sealedPath(f), "utf8")).sha256).toBe(
+    legacy.sha256,
+  );
+  const probed = await f.engine.getUpload(f.created.id);
+  expect(probed.parts[0]).toEqual(legacy);
+  const rewritten = JSON.parse(await readFile(sealedPath(f), "utf8"));
+  expect(rewritten.format).toBe("salyra-receipt/2");
+  expect(rewritten.sha256).toBeUndefined();
+  expect(
+    await holdingDigests(join(f.directory, "content"), [
+      f.bytes.subarray(0, 100000),
+    ]),
+  ).toEqual([]);
+  // the rewritten receipt reads the same, and the upload completes
+  expect((await f.engine.getUpload(f.created.id)).parts[0]).toEqual(legacy);
+  await f.send(1);
+  await f.engine.finishUpload(f.created.id);
+  expect(await f.collect()).toEqual(f.bytes);
+});
+it("rejects a format 1 receipt whose digest was changed", async () => {
+  const f = await fixture();
+  await f.send(0);
+  await writeLegacyReceipt(f, 0);
+  const receipt = JSON.parse(await readFile(sealedPath(f), "utf8"));
+  receipt.sha256 = "0".repeat(64);
+  await writeFile(sealedPath(f), JSON.stringify(receipt));
+  await expect(f.engine.getUpload(f.created.id)).rejects.toMatchObject({
+    code: "ENCRYPTION_AUTH",
+  });
+});
+it("removes the receipts that a format 1 upload left in its completed directory", async () => {
+  const f = await fixture();
+  await f.upload();
+  const folder = join(f.directory, "content", "files", f.created.id);
+  await writeLegacyReceipt(f, 0, folder);
+  expect(await holdingDigests(folder, [f.bytes.subarray(0, 100000)])).toEqual([
+    join(folder, "0.json"),
+  ]);
+  const session = (await f.ledger.get(f.created.id))!;
+  expect(await f.storage.inspectResult(session, undefined)).toMatchObject({
+    found: true,
+  });
+  expect((await readdir(folder)).sort()).toEqual([
+    "0.enc",
+    "1.enc",
+    "reference.json",
+  ]);
+  await writeLegacyReceipt(f, 1, folder);
+  expect(await f.collect()).toEqual(f.bytes);
+  expect((await readdir(folder)).sort()).toEqual([
+    "0.enc",
+    "1.enc",
+    "reference.json",
+  ]);
 });
 it("keeps content when a key is missing and never falls back to plaintext", async () => {
   const f = await fixture();
