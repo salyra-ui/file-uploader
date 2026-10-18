@@ -276,8 +276,46 @@ public final class UploadEngine {
     }
   }
 
+  /**
+   * The lock of one chunk number. Session IDs are hex digests, so a key with a "-part-" suffix is
+   * never another session's ID.
+   */
+  public static String chunkLock(String id, int index) {
+    return id + "-part-" + index;
+  }
+
+  /**
+   * Holds the session lock only to check and to record. The body streams outside it, under a lock
+   * of its own per chunk number taken from the same store, so chunks of one upload arrive side by
+   * side and a slow one blocks nobody.
+   */
   public ObjectNode receivePart(
       String id, int index, String checksum, InputStream body, Context context) throws Exception {
+    PartPlan plan = planPart(id, index, checksum, context);
+    if (plan.existing() != null) return verifyPart(plan.existing(), plan.part(), body, context);
+    try (AutoCloseable chunk = sessions.lock(chunkLock(id, index), context)) {
+      // another request may have stored this chunk number while this one waited
+      ObjectNode current = sessions.get(id);
+      if (current != null)
+        for (JsonNode stored : current.path("parts"))
+          if (stored.path("index").asInt() == index)
+            return verifyPart((ObjectNode) stored, plan.part(), body, context);
+      ObjectNode saved = storage.writePart(plan.session(), plan.part(), body, context);
+      if (saved.path("index").asInt(-1) != index
+          || saved.path("size").asLong(-1) != plan.part().path("size").asLong()
+          || !saved.path("sha256").asText().equals(plan.part().path("sha256").asText()))
+        throw fail(500, "STORAGE_RECEIPT", "Storage returned an invalid receipt");
+      recordPart(id, saved, context);
+      ObjectNode receipt = saved.deepCopy();
+      receipt.remove("reference");
+      return receipt;
+    }
+  }
+
+  /** The session, the requested part and the recorded chunk with this number, if there is one. */
+  record PartPlan(ObjectNode session, ObjectNode part, ObjectNode existing) {}
+
+  PartPlan planPart(String id, int index, String checksum, Context context) throws Exception {
     try (AutoCloseable lease = sessions.lock(id, context)) {
       ObjectNode session = get(id, "part", context);
       if (!session.path("state").asText().equals("open"))
@@ -291,18 +329,64 @@ public final class UploadEngine {
               .put("index", index)
               .put("size", Math.min(chunk, descriptor.path("size").asLong() - index * chunk))
               .put("sha256", checksum);
-      ObjectNode saved = storage.writePart(session, part, body, context);
+      ObjectNode existing = null;
+      for (JsonNode stored : session.path("parts"))
+        if (stored.path("index").asInt() == index) existing = (ObjectNode) stored;
+      return new PartPlan(session, part, existing);
+    }
+  }
+
+  /**
+   * A retransmitted body is consumed and checked: a matching header does not prove matching
+   * content.
+   */
+  ObjectNode verifyPart(ObjectNode existing, ObjectNode part, InputStream body, Context context)
+      throws Exception {
+    MessageDigest digest = hash();
+    long size = 0, expected = part.path("size").asLong();
+    byte[] buffer = new byte[65536];
+    int count;
+    while ((count = body.read(buffer)) != -1) {
+      context.check();
+      size += count;
+      if (size > expected) throw fail(413, "PART_SIZE", "Chunk exceeds expected size");
+      digest.update(buffer, 0, count);
+    }
+    String recorded = existing.path("sha256").asText();
+    if (size != expected
+        || !hex(digest.digest()).equals(recorded)
+        || !part.path("sha256").asText().equals(recorded))
+      throw fail(409, "PART_CONFLICT", "Chunk contains different data");
+    ObjectNode receipt = existing.deepCopy();
+    receipt.remove("reference");
+    return receipt;
+  }
+
+  /**
+   * The session is read again: it may have been canceled or expired while the body streamed, and
+   * other chunks may have been recorded meanwhile.
+   */
+  void recordPart(String id, ObjectNode saved, Context context) throws Exception {
+    try (AutoCloseable lease = sessions.lock(id, context)) {
+      ObjectNode session = get(id, "part", context);
+      if (!session.path("state").asText().equals("open"))
+        throw fail(409, "STATE", "Upload does not accept chunks");
+      int index = saved.path("index").asInt();
       List<ObjectNode> parts = new ArrayList<>();
-      for (JsonNode previous : session.path("parts"))
-        if (previous.path("index").asInt() != index) parts.add((ObjectNode) previous);
+      for (JsonNode previous : session.path("parts")) {
+        if (previous.path("index").asInt() == index) return;
+        parts.add((ObjectNode) previous);
+      }
       parts.add(saved);
       parts.sort(Comparator.comparingInt(p -> p.path("index").asInt()));
       session.set("parts", JSON.valueToTree(parts));
+      // progress keeps a long upload alive: the TTL counts inactivity
+      session.put(
+          "expiresAt",
+          Math.max(
+              session.path("expiresAt").asLong(), System.currentTimeMillis() + options.ttlMillis));
       sessions.save(session);
       notify("part-stored", session, saved, context);
-      ObjectNode receipt = saved.deepCopy();
-      receipt.remove("reference");
-      return receipt;
     }
   }
 

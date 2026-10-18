@@ -70,7 +70,22 @@ public final class Filesystem {
     }
 
     public void save(ObjectNode session) throws Exception {
-      atomic(directory.resolve(safe(session.path("id").asText()) + ".json"), session);
+      String id = safe(session.path("id").asText());
+      atomic(directory.resolve(id + ".json"), session);
+      String state = session.path("state").asText();
+      JsonNode descriptor = session.path("descriptor");
+      long chunk = descriptor.path("chunkSize").asLong();
+      if ((state.equals("completed") || state.equals("canceled") || state.equals("expired"))
+          && chunk >= 1) {
+        // Nothing is received for a finished upload any more: its chunk locks can go. A chunk
+        // request still streaming is refused at its record.
+        long count = Math.max(1, (descriptor.path("size").asLong() + chunk - 1) / chunk);
+        for (int index = 0; index < count; index++)
+          try {
+            Files.deleteIfExists(directory.resolve(chunkLock(id, index) + ".lock"));
+          } catch (IOException ignored) {
+          }
+      }
     }
   }
 
