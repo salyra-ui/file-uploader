@@ -61,7 +61,7 @@ Responses use `{ "code": "...", "message": "..." }`. Validation uses 400, 413 or
 
 ## Storage and locking
 
-Each session operation is serialized across processes through the configured SessionStore. Filesystem stores are local-host implementations. A database-backed store supplies a transaction, compare-and-swap or lease for deployments across multiple hosts. Do not share a local PID lock store across hosts.
+Each session operation is serialized across processes through the configured SessionStore. A chunk body is not: the session lock is held only to check a chunk and to record it, and the body streams under a lock of its own for that chunk number, so chunks of one upload arrive side by side. Recording re-reads the session, so a canceled or expired session refuses the chunk. Filesystem stores are local-host implementations. A database-backed store supplies a transaction, compare-and-swap or lease for deployments across multiple hosts. Do not share a local PID lock store across hosts.
 
 A custom storage adapter consumes the stream once. It validates byte count and checksum, stores the part durably, and returns a serializable receipt. Its probe, finish, inspectResult and abort methods must understand those receipts. Partial overrides preserve the base reference contract explicitly.
 
