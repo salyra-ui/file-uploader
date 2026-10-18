@@ -182,7 +182,49 @@ defmodule SalyraUpload.Engine do
     ])
   end
 
+  # The lock of one chunk number. Session IDs are hex digests, so a key with a "-part-" suffix is
+  # never another session's ID.
+  def chunk_lock(id, index), do: id <> "-part-" <> Integer.to_string(index)
+
+  # Holds the session lock only to check and to record. The body streams outside it, under a lock
+  # of its own per chunk number taken from the same store, so chunks of one upload arrive side by
+  # side and a slow one blocks nobody.
   def receive_part(engine, id, index, checksum, stream, context \\ nil) do
+    {session, part, existing} = plan_part(engine, id, index, checksum, context)
+
+    if existing do
+      verify_part(existing, part, stream)
+    else
+      call(engine.sessions, :transaction, [
+        chunk_lock(id, index),
+        fn ->
+          # another request may have stored this chunk number while this one waited
+          stored =
+            case call(engine.sessions, :get, [id]) do
+              nil -> nil
+              current -> Enum.find(current["parts"], &(&1["index"] == index))
+            end
+
+          if stored do
+            verify_part(stored, part, stream)
+          else
+            saved = call(engine.storage, :write_part, [session, part, stream, context])
+
+            if saved["index"] != part["index"] or saved["size"] != part["size"] or
+                 saved["sha256"] != part["sha256"],
+               do: fail(500, "STORAGE_RECEIPT", "Storage returned an invalid receipt")
+
+            record_part(engine, id, saved, context)
+            Map.take(saved, ["index", "size", "sha256"])
+          end
+        end
+      ])
+    end
+  end
+
+  # Validates under the session lock. Returns the session, the requested part and the recorded
+  # chunk with this number, if there is one.
+  defp plan_part(engine, id, index, checksum, context) do
     call(engine.sessions, :transaction, [
       id,
       fn ->
@@ -200,16 +242,58 @@ defmodule SalyraUpload.Engine do
           "sha256" => checksum
         }
 
-        saved = call(engine.storage, :write_part, [session, part, stream, context])
+        {session, part, Enum.find(session["parts"], &(&1["index"] == index))}
+      end
+    ])
+  end
 
-        parts =
-          (Enum.reject(session["parts"], &(&1["index"] == index)) ++ [saved])
-          |> Enum.sort_by(& &1["index"])
+  # A retransmitted body is consumed and checked: a matching header does not prove matching content.
+  defp verify_part(existing, part, stream) do
+    {digest, size} =
+      Enum.reduce(stream, {:crypto.hash_init(:sha256), 0}, fn bytes, {digest, size} ->
+        size = size + byte_size(bytes)
 
-        session = Map.put(session, "parts", parts)
-        call(engine.sessions, :save, [session])
-        notify(engine, "part-stored", session, context, saved)
-        Map.take(saved, ["index", "size", "sha256"])
+        if size > part["size"],
+          do: fail(413, "PART_SIZE", "Chunk exceeds expected size")
+
+        {:crypto.hash_update(digest, bytes), size}
+      end)
+
+    if size != part["size"] or
+         Base.encode16(:crypto.hash_final(digest), case: :lower) != existing["sha256"] or
+         part["sha256"] != existing["sha256"],
+       do: fail(409, "PART_CONFLICT", "Chunk contains different data")
+
+    Map.take(existing, ["index", "size", "sha256"])
+  end
+
+  # The session is read again: it may have been canceled or expired while the body streamed, and
+  # other chunks may have been recorded meanwhile.
+  defp record_part(engine, id, saved, context) do
+    call(engine.sessions, :transaction, [
+      id,
+      fn ->
+        session = get(engine, id, "part", context)
+        if session["state"] != "open", do: fail(409, "STATE", "Upload does not accept chunks")
+
+        unless Enum.any?(session["parts"], &(&1["index"] == saved["index"])) do
+          # progress keeps a long upload alive: the TTL counts inactivity
+          expires =
+            max(
+              session["expiresAt"],
+              now() + Map.get(engine.options, :ttl_milliseconds, 86_400_000)
+            )
+
+          session =
+            session
+            |> Map.put("parts", Enum.sort_by(session["parts"] ++ [saved], & &1["index"]))
+            |> Map.put("expiresAt", expires)
+
+          call(engine.sessions, :save, [session])
+          notify(engine, "part-stored", session, context, saved)
+        end
+
+        :ok
       end
     ])
   end
