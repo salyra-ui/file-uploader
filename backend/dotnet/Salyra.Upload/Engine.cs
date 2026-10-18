@@ -40,6 +40,7 @@ public sealed class UploadOptions
     public long MaxFileSize { get; init; } = 9007199254740991;
     public long MaxChunkSize { get; init; } = 64 * 1024 * 1024;
     public Func<UploadContext, string> Scope { get; init; } = _ => "";
+
     /// <summary>Without it, anyone who reaches the routes can create, read and finish uploads.</summary>
     public Func<string, JsonObject?, UploadContext, Task>? Authorize { get; init; }
 
@@ -80,7 +81,7 @@ public sealed class UploadEngine(
 
     static long Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    static long Number(JsonNode node, string field)
+    internal static long Number(JsonNode node, string field)
     {
         var value = (JsonValue)node[field]!;
         if (value.TryGetValue<long>(out long wide))
@@ -219,7 +220,8 @@ public sealed class UploadEngine(
             if (state == "finalizing")
             {
                 await Reconcile(session, context);
-                if (Text(session, "state") == "completed") return session;
+                if (Text(session, "state") == "completed")
+                    return session;
             }
             await Storage.Abort(session, context);
             session["state"] = "expired";
@@ -288,11 +290,55 @@ public sealed class UploadEngine(
         return result;
     }
 
+    /// <summary>
+    /// The lock of one chunk number. Session IDs are hex digests, so a key with a "-part-" suffix is
+    /// never another session's ID.
+    /// </summary>
+    public static string ChunkLock(string id, int index) => $"{id}-part-{index}";
+
+    /// <summary>
+    /// Holds the session lock only to check and to record. The body streams outside it, under a
+    /// lock of its own per chunk number taken from the same store, so chunks of one upload arrive
+    /// side by side and a slow one blocks nobody.
+    /// </summary>
     public async Task<JsonObject> ReceivePart(
         string id,
         int index,
         string checksum,
         Stream body,
+        UploadContext context
+    )
+    {
+        var (session, part, existing) = await PlanPart(id, index, checksum, context);
+        if (existing is not null)
+            return await VerifyPart(existing, part, body, context);
+        await using var chunk = await Sessions.Lock(ChunkLock(id, index), context.Cancellation);
+        // another request may have stored this chunk number while this one waited
+        var current = await Sessions.Get(id, context.Cancellation);
+        var stored = current?["parts"]?.AsArray().FirstOrDefault(p => Number(p!, "index") == index);
+        if (stored is not null)
+            return await VerifyPart(stored.AsObject(), part, body, context);
+        var saved = await Storage.WritePart(session, part, body, context);
+        if (
+            Number(saved, "index") != index
+            || Number(saved, "size") != Number(part, "size")
+            || Text(saved, "sha256") != Text(part, "sha256")
+        )
+            throw Fail(500, "STORAGE_RECEIPT", "Storage returned an invalid receipt");
+        await RecordPart(id, saved, context);
+        var receipt = saved.DeepClone().AsObject();
+        receipt.Remove("reference");
+        return receipt;
+    }
+
+    /// <summary>
+    /// Validates under the session lock. Returns the session, the requested part and the recorded
+    /// chunk with this number, if there is one.
+    /// </summary>
+    async Task<(JsonObject Session, JsonObject Part, JsonObject? Existing)> PlanPart(
+        string id,
+        int index,
+        string checksum,
         UploadContext context
     )
     {
@@ -314,20 +360,75 @@ public sealed class UploadEngine(
             ["size"] = Math.Min(chunk, Number(descriptor, "size") - index * chunk),
             ["sha256"] = checksum,
         };
-        var saved = await Storage.WritePart(session, part, body, context);
+        var existing = session["parts"]!
+            .AsArray()
+            .FirstOrDefault(p => Number(p!, "index") == index)
+            ?.AsObject();
+        return (session, part, existing);
+    }
+
+    /// <summary>
+    /// A retransmitted body is consumed and checked: a matching header does not prove matching
+    /// content.
+    /// </summary>
+    static async Task<JsonObject> VerifyPart(
+        JsonObject existing,
+        JsonObject part,
+        Stream body,
+        UploadContext context
+    )
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        long size = 0,
+            expected = Number(part, "size");
+        byte[] buffer = new byte[65536];
+        int count;
+        while ((count = await body.ReadAsync(buffer, context.Cancellation)) > 0)
+        {
+            size += count;
+            if (size > expected)
+                throw Fail(413, "PART_SIZE", "Chunk exceeds expected size");
+            hash.AppendData(buffer, 0, count);
+        }
+        string recorded = Text(existing, "sha256");
+        if (
+            size != expected
+            || Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant() != recorded
+            || Text(part, "sha256") != recorded
+        )
+            throw Fail(409, "PART_CONFLICT", "Chunk contains different data");
+        var receipt = existing.DeepClone().AsObject();
+        receipt.Remove("reference");
+        return receipt;
+    }
+
+    /// <summary>
+    /// The session is read again: it may have been canceled or expired while the body streamed,
+    /// and other chunks may have been recorded meanwhile.
+    /// </summary>
+    async Task RecordPart(string id, JsonObject saved, UploadContext context)
+    {
+        await using var lease = await Sessions.Lock(id, context.Cancellation);
+        var session = await Get(id, "part", context);
+        if (Text(session, "state") != "open")
+            throw Fail(409, "STATE", "Upload does not accept chunks");
+        long index = Number(saved, "index");
+        if (session["parts"]!.AsArray().Any(p => Number(p!, "index") == index))
+            return;
         var parts = session["parts"]!
             .AsArray()
-            .Where(p => Number(p!, "index") != index)
             .Select(p => p!.DeepClone().AsObject())
             .Append(saved)
             .OrderBy(p => Number(p, "index"))
             .ToList();
         session["parts"] = new JsonArray(parts.Select(p => (JsonNode)p).ToArray());
+        // progress keeps a long upload alive: the TTL counts inactivity
+        session["expiresAt"] = Math.Max(
+            Number(session, "expiresAt"),
+            Now() + Options.TtlMilliseconds
+        );
         await Sessions.Save(session, context.Cancellation);
         await Notify("part-stored", session, saved, context);
-        var receipt = saved.DeepClone().AsObject();
-        receipt.Remove("reference");
-        return receipt;
     }
 
     public async Task<JsonNode?> FinishUpload(string id, UploadContext context)

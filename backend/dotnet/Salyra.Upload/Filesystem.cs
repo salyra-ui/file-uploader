@@ -71,12 +71,38 @@ public sealed class DiskSessions(string directory) : ISessionStore
             flock(stream.SafeFileHandle.DangerousGetHandle().ToInt32(), 8);
     }
 
-    static readonly SemaphoreSlim[] Stripes = Enumerable
-        .Range(0, 256)
-        .Select(_ => new SemaphoreSlim(1, 1))
-        .ToArray();
+    // In-process exclusion per lock file. Fixed stripes shared by all locks would deadlock one
+    // request that takes two locks (a chunk's, then the session's) whenever both hashed to the
+    // same stripe, and would make unrelated chunks wait for each other.
+    sealed class Gate
+    {
+        public readonly SemaphoreSlim Semaphore = new(1, 1);
+        public int Users;
+    }
 
-    sealed class Lease(FileStream stream, SemaphoreSlim semaphore) : IAsyncDisposable
+    static readonly Dictionary<string, Gate> Gates = new(StringComparer.Ordinal);
+
+    static Gate Enter(string path)
+    {
+        lock (Gates)
+        {
+            if (!Gates.TryGetValue(path, out var gate))
+                Gates[path] = gate = new Gate();
+            gate.Users++;
+            return gate;
+        }
+    }
+
+    static void Leave(string path, Gate gate)
+    {
+        lock (Gates)
+        {
+            if (--gate.Users == 0)
+                Gates.Remove(path);
+        }
+    }
+
+    sealed class Lease(FileStream stream, string path, Gate gate) : IAsyncDisposable
     {
         public ValueTask DisposeAsync()
         {
@@ -87,7 +113,8 @@ public sealed class DiskSessions(string directory) : ISessionStore
             finally
             {
                 stream.Dispose();
-                semaphore.Release();
+                gate.Semaphore.Release();
+                Leave(path, gate);
             }
             return ValueTask.CompletedTask;
         }
@@ -97,18 +124,16 @@ public sealed class DiskSessions(string directory) : ISessionStore
     {
         Disk.Safe(id);
         Directory.CreateDirectory(directory);
-        var semaphore = Stripes[
-            (
-                StringComparer.Ordinal.GetHashCode(Path.GetFullPath(Path.Combine(directory, id)))
-                & int.MaxValue
-            ) % Stripes.Length
-        ];
-        await semaphore.WaitAsync(token);
+        string path = Path.GetFullPath(Path.Combine(directory, id + ".lock"));
+        var gate = Enter(path);
+        bool held = false;
         FileStream? stream = null;
         try
         {
+            await gate.Semaphore.WaitAsync(token);
+            held = true;
             stream = new FileStream(
-                Path.Combine(directory, id + ".lock"),
+                path,
                 FileMode.OpenOrCreate,
                 FileAccess.ReadWrite,
                 FileShare.ReadWrite
@@ -119,7 +144,7 @@ public sealed class DiskSessions(string directory) : ISessionStore
                 try
                 {
                     Acquire(stream);
-                    return new Lease(stream, semaphore);
+                    return new Lease(stream, path, gate);
                 }
                 catch (IOException)
                 {
@@ -130,7 +155,9 @@ public sealed class DiskSessions(string directory) : ISessionStore
         catch
         {
             stream?.Dispose();
-            semaphore.Release();
+            if (held)
+                gate.Semaphore.Release();
+            Leave(path, gate);
             throw;
         }
     }
@@ -143,12 +170,30 @@ public sealed class DiskSessions(string directory) : ISessionStore
             : null;
     }
 
-    public Task Save(JsonObject session, CancellationToken token) =>
-        Disk.Atomic(
-            Path.Combine(directory, Disk.Safe(session["id"]!.GetValue<string>()) + ".json"),
-            session,
-            token
-        );
+    public async Task Save(JsonObject session, CancellationToken token)
+    {
+        string id = Disk.Safe(session["id"]!.GetValue<string>());
+        await Disk.Atomic(Path.Combine(directory, id + ".json"), session, token);
+        var descriptor = session["descriptor"]!;
+        long chunk = UploadEngine.Number(descriptor, "chunkSize");
+        if (
+            session["state"]?.GetValue<string>() is "completed" or "canceled" or "expired"
+            && chunk >= 1
+        )
+        {
+            // Nothing is received for a finished upload any more: its chunk locks can go. A chunk
+            // request still streaming is refused at its record.
+            long count = Math.Max(1, (UploadEngine.Number(descriptor, "size") + chunk - 1) / chunk);
+            for (int index = 0; index < count; index++)
+                try
+                {
+                    File.Delete(
+                        Path.Combine(directory, UploadEngine.ChunkLock(id, index) + ".lock")
+                    );
+                }
+                catch (IOException) { }
+        }
+    }
 }
 
 public sealed class DiskStorage(string directory) : IStorage
