@@ -147,6 +147,42 @@ pub fn now() -> u64 {
 fn count(d: &Descriptor) -> usize {
     (d.size.div_ceil(d.chunk_size).max(1)) as usize
 }
+/// The lock of one chunk number. Session IDs are hex digests, so a key with a `-part-` suffix is
+/// never another session's ID.
+pub fn chunk_lock(id: &str, index: usize) -> String {
+    format!("{id}-part-{index}")
+}
+/// Consumes a retransmitted body and compares it with the recorded chunk. A matching header does
+/// not prove matching content.
+fn verify_part(old: &Part, p: &Part, body: &mut dyn Read, c: &Context) -> Result<Value> {
+    let mut hash = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        c.check()?;
+        let read = body.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        if size > p.size {
+            return Err(Error::new(
+                413,
+                "PART_SIZE",
+                "Chunk exceeds its expected size",
+            ));
+        }
+        hash.update(&buffer[..read]);
+    }
+    if size != p.size || format!("{:x}", hash.finalize()) != old.sha256 || p.sha256 != old.sha256 {
+        return Err(Error::new(
+            409,
+            "PART_CONFLICT",
+            "Chunk contains different data",
+        ));
+    }
+    Ok(json!({"index":old.index,"size":old.size,"sha256":old.sha256}))
+}
 impl Engine {
     fn authorize(&self, op: &str, s: Option<&Session>, c: &Context) -> Result<()> {
         match &self.options.authorize {
@@ -285,6 +321,9 @@ impl Engine {
         };
         Ok(result)
     }
+    /// Holds the session lock only to check and to record. The body streams outside it, under a
+    /// lock of its own per chunk number taken from the same store (key `<id>-part-<index>`), so
+    /// chunks of one upload arrive side by side and a slow one blocks nobody.
     pub fn receive_part(
         &self,
         id: &str,
@@ -293,8 +332,39 @@ impl Engine {
         body: &mut dyn Read,
         c: &Context,
     ) -> Result<Value> {
+        let (session, p, existing) = self.plan_part(id, index, sha256, c)?;
+        if let Some(old) = existing {
+            return verify_part(&old, &p, body, c);
+        }
+        let _chunk = self.sessions.lock(&chunk_lock(id, index), c)?;
+        // another request may have stored this chunk number while this one waited
+        if let Some(current) = self.sessions.get(id)? {
+            if let Some(old) = current.parts.iter().find(|part| part.index == index) {
+                return verify_part(old, &p, body, c);
+            }
+        }
+        let saved = self.storage.write_part(&session, &p, body, c)?;
+        if saved.index != index || saved.size != p.size || saved.sha256 != p.sha256 {
+            return Err(Error::new(
+                500,
+                "STORAGE_RECEIPT",
+                "Storage returned an invalid receipt",
+            ));
+        }
+        self.record_part(id, &saved, c)?;
+        Ok(json!({"index":saved.index,"size":saved.size,"sha256":saved.sha256}))
+    }
+    /// Validates the request under the session lock. The last value is the recorded chunk with
+    /// this number, if there is one.
+    fn plan_part(
+        &self,
+        id: &str,
+        index: usize,
+        sha256: &str,
+        c: &Context,
+    ) -> Result<(Session, Part, Option<Part>)> {
         let _lease = self.sessions.lock(id, c)?;
-        let mut s = self.get(id, "part", c)?;
+        let s = self.get(id, "part", c)?;
         if s.state != "open" {
             return Err(Error::new(409, "STATE", "Upload does not accept chunks"));
         };
@@ -315,13 +385,28 @@ impl Engine {
             sha256: sha256.into(),
             reference: Value::Null,
         };
-        let saved = self.storage.write_part(&s, &p, body, c)?;
-        s.parts.retain(|p| p.index != index);
+        let existing = s.parts.iter().find(|part| part.index == index).cloned();
+        Ok((s, p, existing))
+    }
+    /// Stores a written chunk in the session under the session lock. The session is read again:
+    /// it may have been canceled or expired while the body streamed, and other chunks may have
+    /// been recorded meanwhile.
+    fn record_part(&self, id: &str, saved: &Part, c: &Context) -> Result<()> {
+        let _lease = self.sessions.lock(id, c)?;
+        let mut s = self.get(id, "part", c)?;
+        if s.state != "open" {
+            return Err(Error::new(409, "STATE", "Upload does not accept chunks"));
+        };
+        if s.parts.iter().any(|part| part.index == saved.index) {
+            return Ok(());
+        }
         s.parts.push(saved.clone());
-        s.parts.sort_by_key(|p| p.index);
+        s.parts.sort_by_key(|part| part.index);
+        // progress keeps a long upload alive: the TTL counts inactivity
+        s.expires_at = s.expires_at.max(now() + self.options.ttl_ms);
         self.sessions.save(&s)?;
-        (self.options.notify)("part-stored", &s, Some(&saved), c);
-        Ok(json!({"index":saved.index,"size":saved.size,"sha256":saved.sha256}))
+        (self.options.notify)("part-stored", &s, Some(saved), c);
+        Ok(())
     }
     pub fn finish_upload(&self, id: &str, c: &Context) -> Result<Value> {
         let _lease = self.sessions.lock(id, c)?;

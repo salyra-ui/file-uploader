@@ -14,6 +14,9 @@ const buffered = process.env.SALYRA_BUFFERED_BODIES === "1";
 const digest = (body: string) =>
   createHash("sha256").update(body).digest("hex");
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// Chunks above 1 KiB: tiny_http (Rust) reads a smaller body whole before it hands the request over.
+const SIZE = 2048;
+const block = (seed: string) => seed.repeat(SIZE / seed.length);
 
 async function send(path: string, method = "GET", body?: string) {
   const response = await fetch(`${base}${path}`, {
@@ -33,10 +36,10 @@ async function create(chunks: number) {
     body: JSON.stringify({
       protocol: "salyra-upload/1",
       name: "parallel.txt",
-      size: chunks * 4,
+      size: chunks * SIZE,
       type: "text/plain",
       lastModified: 0,
-      chunkSize: 4,
+      chunkSize: SIZE,
     }),
   });
   assert.equal(response.status, 200);
@@ -71,8 +74,8 @@ function stalled(id: string, index: number, body: string) {
       });
     },
   );
-  request.write(body.slice(0, 2));
-  return { done, finish: () => request.end(body.slice(2)) };
+  request.write(body.slice(0, SIZE / 2));
+  return { done, finish: () => request.end(body.slice(SIZE / 2)) };
 }
 async function within<T>(promise: Promise<T>, ms: number, what: string) {
   let timer: NodeJS.Timeout | undefined;
@@ -104,12 +107,12 @@ function inContainer(script: string) {
     encoding: "utf8",
   });
 }
-const text = (index: number) => String(1000 + index);
+const text = (index: number) => block(String(1000 + index));
 
 // 1. A chunk that is still streaming blocks no other chunk of the same upload.
 {
   const { id } = await create(4);
-  const slow = stalled(id, 0, "abcd");
+  const slow = stalled(id, 0, block("abcd"));
   await sleep(500);
   const others = await within(
     Promise.all(
@@ -130,21 +133,21 @@ const text = (index: number) => String(1000 + index);
   slow.finish();
   const first = await within(slow.done, 8000, "chunk 0");
   assert.equal(first.status, 200, JSON.stringify(first.value));
-  assert.equal(first.value.sha256, digest("abcd"));
+  assert.equal(first.value.sha256, digest(block("abcd")));
   const completed = await send(`/${id}/complete`, "POST");
   assert.equal(completed.status, 200, JSON.stringify(completed.value));
   assert.equal(
     completed.value.sha256,
-    digest("abcd" + [1, 2, 3].map(text).join("")),
+    digest(block("abcd") + [1, 2, 3].map(text).join("")),
   );
 }
 
 // 2. One writer per chunk number: the same chunk sent twice at once is stored once.
 {
   const { id } = await create(2);
-  const slow = stalled(id, 0, "abcd");
+  const slow = stalled(id, 0, block("abcd"));
   await sleep(500);
-  const twin = send(`/${id}/parts/0`, "PUT", "abcd");
+  const twin = send(`/${id}/parts/0`, "PUT", block("abcd"));
   if (!buffered)
     assert.ok(
       await pendingFor(twin, 800),
@@ -158,19 +161,22 @@ const text = (index: number) => String(1000 + index);
   );
   assert.equal(first.status, 200, JSON.stringify(first.value));
   assert.equal(second.status, 200, JSON.stringify(second.value));
-  assert.equal(second.value.sha256, digest("abcd"));
+  assert.equal(second.value.sha256, digest(block("abcd")));
   const after = await send(`/${id}`);
   assert.deepEqual(
     after.value.parts.map((part: { index: number }) => part.index),
     [0],
   );
   if (buffered)
-    assert.equal((await send(`/${id}/parts/1`, "PUT", "efgh")).status, 200);
+    assert.equal(
+      (await send(`/${id}/parts/1`, "PUT", block("efgh"))).status,
+      200,
+    );
   else {
     // a different body for a chunk that waited is a conflict, not a second copy
-    const rival = stalled(id, 1, "efgh");
+    const rival = stalled(id, 1, block("efgh"));
     await sleep(500);
-    const wrong = send(`/${id}/parts/1`, "PUT", "zzzz");
+    const wrong = send(`/${id}/parts/1`, "PUT", block("zzzz"));
     assert.ok(await pendingFor(wrong, 800));
     rival.finish();
     await within(rival.done, 8000, "chunk 1");
@@ -179,13 +185,13 @@ const text = (index: number) => String(1000 + index);
     assert.equal(conflict.value.code, "PART_CONFLICT");
   }
   const completed = await send(`/${id}/complete`, "POST");
-  assert.equal(completed.value.sha256, digest("abcdefgh"));
+  assert.equal(completed.value.sha256, digest(block("abcd") + block("efgh")));
 }
 
 // 3. A session canceled while a chunk streams does not take the chunk.
 {
   const { id } = await create(2);
-  const slow = stalled(id, 0, "abcd");
+  const slow = stalled(id, 0, block("abcd"));
   await sleep(500);
   assert.equal((await send(`/${id}`, "DELETE")).status, 200);
   slow.finish();

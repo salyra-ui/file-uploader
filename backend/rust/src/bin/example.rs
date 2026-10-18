@@ -8,7 +8,7 @@ fn main() {
     let directory = PathBuf::from(std::env::var("UPLOAD_DIRECTORY").unwrap_or(".uploads".into()));
     let host = std::env::var("HOST").unwrap_or("127.0.0.1".into());
     let port = std::env::var("PORT").unwrap_or("4337".into());
-    let engine = Engine {
+    let engine = Arc::new(Engine {
         sessions: Arc::new(DiskSessions {
             directory: directory.join("sessions"),
         }),
@@ -20,13 +20,17 @@ fn main() {
             allow_anonymous: true,
             ..Options::default()
         },
-    };
+    });
     let server = tiny_http::Server::http(format!("{host}:{port}")).unwrap();
+    // One thread per request, so the chunks of one upload are received side by side.
     for request in server.incoming_requests() {
-        if let Some(route) = default_route(&request, "/uploads") {
-            handle(&engine, request, route, Context::default())
-        } else {
-            let _ = request.respond(tiny_http::Response::empty(404));
-        }
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            if let Some(route) = default_route(&request, "/uploads") {
+                handle(&engine, request, route, Context::default())
+            } else {
+                let _ = request.respond(tiny_http::Response::empty(404));
+            }
+        });
     }
 }

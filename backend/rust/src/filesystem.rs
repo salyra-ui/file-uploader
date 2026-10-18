@@ -4,9 +4,20 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::Duration,
 };
+static TEMPORARY: AtomicU64 = AtomicU64::new(0);
+/// A temporary file name no other thread or process uses: chunks of one upload write side by side.
+fn unique() -> String {
+    format!(
+        "{}-{}-{}",
+        now(),
+        std::process::id(),
+        TEMPORARY.fetch_add(1, Ordering::Relaxed)
+    )
+}
 fn safe(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 100
@@ -20,7 +31,7 @@ fn safe(id: &str) -> Result<()> {
     }
 }
 fn atomic(path: &Path, value: &impl Serialize) -> Result<()> {
-    let temp = path.with_extension(format!("{}.tmp", now()));
+    let temp = path.with_extension(format!("{}.tmp", unique()));
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -77,7 +88,20 @@ impl SessionStore for DiskSessions {
     }
     fn save(&self, s: &Session) -> Result<()> {
         safe(&s.id)?;
-        atomic(&self.directory.join(format!("{}.json", s.id)), s)
+        atomic(&self.directory.join(format!("{}.json", s.id)), s)?;
+        // Nothing is received for a finished upload any more: its chunk locks can go. A chunk
+        // request still streaming is refused at its record.
+        if matches!(s.state.as_str(), "completed" | "canceled" | "expired")
+            && s.descriptor.chunk_size > 0
+        {
+            for index in 0..count(&s.descriptor) {
+                let _ = fs::remove_file(
+                    self.directory
+                        .join(format!("{}.lock", chunk_lock(&s.id, index))),
+                );
+            }
+        }
+        Ok(())
     }
 }
 pub struct DiskStorage {
@@ -132,7 +156,7 @@ impl Storage for DiskStorage {
         }
         let temp = self
             .parts(s)
-            .join(format!(".part-{}-{}.tmp", p.index, now()));
+            .join(format!(".part-{}-{}.tmp", p.index, unique()));
         let mut output = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -230,7 +254,7 @@ impl Storage for DiskStorage {
         }
         let target = self.result(s);
         fs::create_dir_all(target.parent().unwrap())?;
-        let temp = target.with_extension(format!("{}.tmp", now()));
+        let temp = target.with_extension(format!("{}.tmp", unique()));
         let mut out = OpenOptions::new()
             .create_new(true)
             .write(true)
