@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "salyra-upload-server"
+version = "0.1.0"
+description = "Streaming upload sessions and configurable storage for salyra-upload/1"
+requires-python = ">=3.11"
+license = "MIT"
+readme = "README.md"
+[project.urls]
+Documentation = "https://salyra-ui.github.io/docs/upload-server.html"
+Source = "https://github.com/salyra-ui/file-upload"

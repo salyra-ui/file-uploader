@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://salyra-ui.github.io/docs/protocol/upload-v1.json",
+  "$defs": {
+    "descriptor": {
+      "type": "object",
+      "required": [
+        "protocol",
+        "name",
+        "size",
+        "type",
+        "lastModified",
+        "chunkSize"
+      ],
+      "properties": {
+        "protocol": { "const": "salyra-upload/1" },
+        "name": { "type": "string", "maxLength": 1024 },
+        "size": { "type": "integer", "minimum": 0 },
+        "type": { "type": "string" },
+        "lastModified": { "type": "integer", "minimum": 0 },
+        "chunkSize": { "type": "integer", "minimum": 1 },
+        "metadata": { "type": "object" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "required": ["id", "chunkSize", "expiresAt"],
+      "properties": {
+        "id": { "type": "string" },
+        "chunkSize": { "type": "integer", "minimum": 1 },
+        "expiresAt": { "type": "integer" }
+      }
+    },
+    "part": {
+      "type": "object",
+      "required": ["index", "size", "sha256"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "required": ["status", "parts"],
+      "properties": {
+        "status": {
+          "enum": ["open", "finalizing", "completed", "canceled", "expired"]
+        },
+        "parts": { "type": "array", "items": { "$ref": "#/$defs/part" } },
+        "expiresAt": { "type": "integer" },
+        "result": {}
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

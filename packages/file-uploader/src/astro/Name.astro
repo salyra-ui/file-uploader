@@ -1,0 +1,7 @@
+---
+const { children, ...attrs } = Astro.props;
+---
+
+<span {...attrs} data-upload-name>
+  <slot />
+</span>

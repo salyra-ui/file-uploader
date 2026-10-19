@@ -1,0 +1,32 @@
+---
+import { FileUploader } from "../../../../../release/file-uploader/dist/astro/index";
+---
+
+<html lang="en">
+  <head>
+    <title>Astro uploader test</title>
+  </head>
+  <body>
+    <FileUploader.Root
+      id="uploader"
+      options={{ endpoint: "/uploads", chunkSize: 262144 }}
+    >
+      <FileUploader.Input aria-label="Select files" multiple />
+      <FileUploader.Action action="start">Upload</FileUploader.Action>
+      <FileUploader.List as="div">
+        <template data-upload-template>
+          <FileUploader.Item as="article" class="custom-row">
+            <FileUploader.Name />
+            <FileUploader.Status />
+            <FileUploader.Action action="cancel">Cancel</FileUploader.Action>
+            <FileUploader.Action action="retry">Retry</FileUploader.Action>
+            <FileUploader.Progress aria-label="Upload progress">
+              <span data-upload-percentage />
+            </FileUploader.Progress>
+          </FileUploader.Item>
+        </template>
+      </FileUploader.List>
+      <FileUploader.Output />
+    </FileUploader.Root>
+  </body>
+</html>

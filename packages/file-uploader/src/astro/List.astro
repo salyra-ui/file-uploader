@@ -1,0 +1,7 @@
+---
+const { children, as: Tag = "ul", ...attrs } = Astro.props;
+---
+
+<Tag {...attrs} data-upload-list>
+  <slot />
+</Tag>

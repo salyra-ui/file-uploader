@@ -1,0 +1,14 @@
+{
+  "name": "salyra-ui/upload-server",
+  "description": "Streaming upload sessions and configurable storage",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "Salyra\\Upload\\": "src/"
+    }
+  }
+}

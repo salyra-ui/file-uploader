@@ -1,0 +1,33 @@
+---
+import type { HTMLAttributes } from "astro/types";
+import type { UploadBootstrap } from "./bootstrap";
+interface Props extends HTMLAttributes<"div"> {
+  options: UploadBootstrap;
+  class?: string;
+  id?: string;
+}
+const { options, ...attrs } = Astro.props;
+const serialized = JSON.stringify(options).replace(/</g, "\\u003c");
+---
+
+<salyra-file-uploader {...attrs} data-upload-root>
+  <script type="application/json" data-upload-options set:html={serialized} />
+  <slot />
+</salyra-file-uploader>
+<script>
+  import { connectUploader } from "./bootstrap";
+  if (!customElements.get("salyra-file-uploader"))
+    customElements.define(
+      "salyra-file-uploader",
+      class extends HTMLElement {
+        private dispose?: () => void;
+        connectedCallback() {
+          if (!this.dispose) this.dispose = connectUploader(this);
+        }
+        disconnectedCallback() {
+          this.dispose?.();
+          this.dispose = undefined;
+        }
+      },
+    );
+</script>

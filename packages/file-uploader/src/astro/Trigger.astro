@@ -1,0 +1,7 @@
+---
+const { children, ...attrs } = Astro.props;
+---
+
+<button {...attrs} data-upload-trigger>
+  <slot />
+</button>

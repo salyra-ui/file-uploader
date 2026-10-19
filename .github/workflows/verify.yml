@@ -1,0 +1,49 @@
+name: Verify packages and upload protocol
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  browser-and-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --legacy-peer-deps
+      - run: npm run check
+      - run: npm run check:frameworks
+      - run: npm run check:examples
+      - run: npm test
+      - run: node --import tsx scripts/stress.ts
+      - run: node --import tsx scripts/stress.ts
+        env:
+          SALYRA_STRESS_ENCRYPTED: "1"
+      - run: npm run build
+      - run: node scripts/consumer.mjs
+      - run: node scripts/framework-browser.mjs
+      - run: npx playwright install --with-deps chromium firefox webkit
+      - run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-failure
+          path: test-results
+  native:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [go, rust, jvm, python, php, ruby, dotnet, elixir, c]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --legacy-peer-deps
+      - run: bash scripts/native.sh ${{ matrix.language }}

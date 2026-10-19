@@ -1,0 +1,50 @@
+{
+  "name": "salyra-upload-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "tsx scripts/dev.ts",
+    "build": "node scripts/build.mjs",
+    "test:browser": "playwright test",
+    "check:frameworks": "tsx scripts/frameworks.ts && svelte-check --tsconfig ./tsconfig.json && ngc -p tsconfig.angular.json",
+    "check:examples": "tsx scripts/snippets.ts",
+    "test:native": "bash scripts/native.sh",
+    "format": "prettier --write packages examples scripts tests"
+  },
+  "devDependencies": {
+    "@angular/common": "~20.3.33",
+    "@angular/compiler": "~20.3.33",
+    "@angular/compiler-cli": "~20.3.33",
+    "@angular/core": "~20.3.33",
+    "@angular/platform-browser": "~20.3.33",
+    "@astrojs/compiler": "2.13.1",
+    "@aws-sdk/client-s3": "^3.1146.0",
+    "@babel/generator": "^7.29.8",
+    "@babel/parser": "^7.29.9",
+    "@playwright/test": "^1.50.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@vue/server-renderer": "^3.5.0",
+    "astro": "^7.3.5",
+    "esbuild": "^0.28.2",
+    "prettier": "^3.9.9",
+    "prettier-plugin-astro": "^1.1.0",
+    "prettier-plugin-svelte": "^4.1.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "rxjs": "^7.8.1",
+    "svelte": "^5.20.0",
+    "svelte-check": "^4.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "~5.8.3",
+    "vite": "^6.1.0",
+    "vitest": "^4.1.11",
+    "vue": "^3.5.0"
+  }
+}

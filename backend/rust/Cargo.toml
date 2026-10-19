@@ -1,0 +1,19 @@
+[package]
+name = "salyra-upload-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Streaming upload sessions with configurable storage and HTTP integration"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+fs2 = "0.4"
+tiny_http = { version = "0.12", optional = true }
+[features]
+default = []
+http = ["dep:tiny_http"]
+[[bin]]
+name = "example"
+path = "src/bin/example.rs"
+required-features = ["http"]

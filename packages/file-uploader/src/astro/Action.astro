@@ -1,0 +1,12 @@
+---
+const { children, action, itemId, ...attrs } = Astro.props;
+---
+
+<button
+  {...attrs}
+  type={attrs.type ?? "button"}
+  data-upload-action={action}
+  data-upload-item-id={itemId}
+>
+  <slot />
+</button>

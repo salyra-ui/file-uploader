@@ -1,0 +1,46 @@
+{
+  "name": "@salyra-ui/file-uploader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "description": "Composable file uploads with chunked transfers, retry and verified resume.",
+  "homepage": "https://salyra-ui.github.io/docs/file-uploader.html",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/salyra-ui/file-upload"
+  },
+  "exports": {
+    ".": "./src/core/index.ts",
+    "./react": "./src/react/index.tsx",
+    "./vue": "./src/vue/index.ts",
+    "./svelte": "./src/svelte/index.ts",
+    "./angular": "./src/angular/index.ts",
+    "./vanilla": "./src/vanilla/index.ts",
+    "./http": "./src/transport/http.ts",
+    "./chunked": "./src/transport/chunked.ts"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "svelte": ">=5",
+    "vue": ">=3.5",
+    "@angular/core": ">=20"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "svelte": {
+      "optional": true
+    },
+    "vue": {
+      "optional": true
+    },
+    "@angular/core": {
+      "optional": true
+    }
+  }
+}

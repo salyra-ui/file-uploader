@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "allowImportingTsExtensions": false,
+    "outDir": "artifacts/types"
+  },
+  "include": ["packages/**/*.ts", "packages/**/*.tsx"],
+  "exclude": [
+    "packages/file-uploader/src/angular/**",
+    "packages/file-uploader/src/astro/index.ts",
+    "packages/file-uploader/src/svelte/index.ts"
+  ]
+}
